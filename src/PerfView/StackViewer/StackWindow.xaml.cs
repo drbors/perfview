@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -15,7 +14,6 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Xml;
 using Controls;
-using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Stacks;
 using Graphs;
 using PerfView.Dialogs;
@@ -26,7 +24,6 @@ using Diagnostics.Tracing.StackSources;
 using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Utilities;
 using System.Threading;
-using PerfView.GuiUtilities;
 using Utilities;
 using Path = System.IO.Path;
 
@@ -220,10 +217,8 @@ namespace PerfView
         public PerfViewStackSource DataSource { get; private set; }
 
         // TODO resolve the redundancy with DataSource.  
-        public StackSource StackSource
-        {
-            get { return m_stackSource; }
-        }
+        public StackSource StackSource => m_stackSource;
+
         /// <summary>
         /// This sets the window to to the given stack source, this DOES triggers an update of the gridViews.  
         /// </summary>
@@ -369,7 +364,7 @@ namespace PerfView
                     }
 
                     // SignalPropertyChange the Caller-Callee Tab
-                    SetFocus(null);
+                    SetFocus(m_callTree.Root);
 
                     ByNameDataGrid.Focus();
 
@@ -464,7 +459,6 @@ namespace PerfView
                 GroupRegExTextBox.Text = justMyApp;
             }
 
-
             // If we have a JustMyApp, add it to list of Group Pattern possibilities 
             if (justMyApp != null)
                 GroupRegExTextBox.Items.Insert(0, justMyApp);
@@ -479,11 +473,9 @@ namespace PerfView
                 SetStackSource(m_stackSource);  //  This forces a recomputation of the calltree.  
         }
 
-        public CallTree CallTree
-        {
-            get { return m_callTree; }
-        }
-        public CallTreeView CallTreeView { get { return m_callTreeView; } }
+        public CallTree CallTree => m_callTree;
+
+        public CallTreeView CallTreeView => m_callTreeView;
 
         /// <summary>
         /// Note that setting the filter does NOT trigger an update of the gridViews.  You have to call Update()
@@ -580,6 +572,28 @@ namespace PerfView
         }
 
         public string FocusName { get { return CallerCalleeView.FocusName; } }
+
+        public bool SetFocus(CallTreeNodeBase node)
+        {
+            CallerCalleeView.SetFocus(node.Name, m_callTree);
+
+            m_calleesView.SetRoot(AggregateCallTreeNode.CalleeTree(node));
+            if (IsMemoryWindow)
+                CalleesTitle.Text = "Objects that are referred to by " + node.Name;
+            else
+                CalleesTitle.Text = "Methods that are called by " + node.Name;
+
+            m_callersView.SetRoot(AggregateCallTreeNode.CallerTree(node));
+
+            if (IsMemoryWindow)
+                CallersTitle.Text = "Objects that refer to " + node.Name;
+            else
+                CallersTitle.Text = "Methods that call " + node.Name;
+            DataContext = node;
+
+            return true;
+        }
+
         public bool SetFocus(string name)
         {
             if (name == null)
@@ -637,37 +651,8 @@ namespace PerfView
             FindNext(null);         // Restart the find operation. 
             return FindNext(pat);
         }
-        public bool FindNext()
-        {
-            return FindNext(FindTextBox.Text);
-        }
-        /// <summary>
-        /// Finds oin the ByName view.
-        /// </summary>
-        /// <param name="name"></param>
-        public void FindByName(string name)
-        {
-            for (int i = 0; i < m_byNameView.Count; i++)
-            {
-                var item = m_byNameView[i];
-                if (name == item.DisplayName)
-                {
-                    ByNameDataGrid.Grid.SelectedIndex = i;
-                    // Hack!  Wait for items to be populated
-                    try
-                    {
-                        ByNameDataGrid.Grid.ScrollIntoView(item);
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.WriteLine("Caught Exception while scrolling " + e.ToString());
-                    }
-                    ByNameTab.IsSelected = true;
-                    return;
-                }
-            }
-            StatusBar.LogError("Name '" + name + "' not found");
-        }
+
+        public bool FindNext() => FindNext(FindTextBox.Text);
 
         /// <summary>
         /// If we save this view as a file, this is its name (may be null) 
@@ -719,10 +704,9 @@ namespace PerfView
             if (m_historyPos + 1 < m_history.Count)
                 e.CanExecute = true;
         }
-        private void DoClose(object sender, RoutedEventArgs e)
-        {
-            Close();
-        }
+
+        private void DoClose(object sender, RoutedEventArgs e) => Close();
+
         private void DoOpenParent(object sender, RoutedEventArgs e)
         {
             for (; ; )
@@ -755,10 +739,8 @@ namespace PerfView
                 }
             }
         }
-        private void DoSetSymbolPath(object sender, RoutedEventArgs e)
-        {
-            GuiApp.MainWindow.DoSetSymbolPath(sender, e);
-        }
+        private void DoSetSymbolPath(object sender, RoutedEventArgs e) => GuiApp.MainWindow.DoSetSymbolPath(sender, e);
+
         private void DoSetSourcePath(object sender, RoutedEventArgs e)
         {
             var symPathDialog = new SymbolPathDialog(App.SourcePath, "Source", delegate (string newPath)
@@ -930,85 +912,39 @@ namespace PerfView
                 });
             });
         }
-        internal void DoUpdate(object sender, RoutedEventArgs e)
-        {
-            Update();
-        }
-        private void DoFindNext(object sender, RoutedEventArgs e)
-        {
-            FindNext();
-        }
-        private void DoFindEnter(object sender, RoutedEventArgs e)
-        {
-            Find(FindTextBox.Text);
-        }
 
-        private void DoCancel(object sender, ExecutedRoutedEventArgs e)
-        {
-            StatusBar.AbortWork();
-        }
+        private void DoUpdate(object sender, RoutedEventArgs e) => Update();
+
+        private void DoFindNext(object sender, RoutedEventArgs e) => FindNext();
+
+        private void DoFindEnter(object sender, RoutedEventArgs e) => Find(FindTextBox.Text);
+
+        private void DoCancel(object sender, ExecutedRoutedEventArgs e) => StatusBar.AbortWork();
+
         private void DoToggleNoPadOnCopy(object sender, ExecutedRoutedEventArgs e)
         {
             PerfDataGrid.NoPadOnCopyToClipboard = !PerfDataGrid.NoPadOnCopyToClipboard;
             StatusBar.Status = "No Pad On Copy is now " + PerfDataGrid.NoPadOnCopyToClipboard;
         }
 
-        private bool GetSamplesForSelection(out bool[] sampleSet, out string name)
+        private bool GetSamplesForSelection(bool exclusiveSamples, out bool[] sampleSet, out string name)
         {
             name = "";
             sampleSet = null;
-
-            var cells = SelectedCells();
-            if (cells == null || cells.Count <= 0)
-            {
-                StatusBar.LogError("No cells selected.");
-                return false;
-            }
-
-            // TODO FIX NOW make this work. 
-            if (CallerCalleeTab.IsSelected)
-            {
-                StatusBar.LogError("Sorry, Drill Into and other operations that select samples is not implemented in the caller-callee view.  " +
-                    "Often you can get what you need from the ByName view.");
-                return false;
-            }
 
             var addedDots = false;
             Debug.Assert(CallTree.StackSource.BaseStackSource == m_stackSource);
             var localSampleSet = new bool[m_stackSource.SampleIndexLimit];
 
             // TODO do I need to do this off the GUI thread?  
-            foreach (var cell in cells)
+            var selectedNodes = GetSelectedNodes();
+            foreach (var asCallTreeNodeBase in selectedNodes)
             {
-                bool exclusiveSamples = false;
-                var colName = ((TextBlock)cell.Column.Header).Name;
-                if (colName.StartsWith("Exc"))
-                    exclusiveSamples = true;
-                if (colName.StartsWith("Fold"))
-                {
-                    StatusBar.LogError("Cannot drill into folded samples.  Use Exc instead.");
-                    return false;
-                }
-
-                var item = cell.Item;
-                var asCallTreeNodeBase = item as CallTreeNodeBase;
-                if (asCallTreeNodeBase == null)
-                {
-                    var asCallTreeViewNode = item as CallTreeViewNode;
-                    if (asCallTreeViewNode != null)
-                        asCallTreeNodeBase = asCallTreeViewNode.Data;
-                    else
-                    {
-                        StatusBar.LogError("Could not find data item.");
-                        return false;
-                    }
-                }
-
                 asCallTreeNodeBase.GetSamples(exclusiveSamples, delegate (StackSourceSampleIndex sampleIdx)
                 {
                     // We should only count a sample once unless we are combining different cells. 
                     Debug.Assert((int)sampleIdx < localSampleSet.Length);
-                    Debug.Assert(!localSampleSet[(int)sampleIdx] || cells.Count > 1);
+                    Debug.Assert(!localSampleSet[(int)sampleIdx] || selectedNodes.Count > 1);
                     localSampleSet[(int)sampleIdx] = true;
                     return true;
                 });
@@ -1024,20 +960,19 @@ namespace PerfView
             return true;
         }
 
+        private void CanExecuteMemoryOperation(object sender, CanExecuteRoutedEventArgs e) => e.CanExecute = m_stackSource is MemoryGraphStackSource;
+
         private void DoDumpObject(object sender, ExecutedRoutedEventArgs e)
         {
-            var asMemoryStackSource = m_stackSource as MemoryGraphStackSource;
-            if (asMemoryStackSource == null)
-            {
-                StatusBar.LogError("DumpObject only works when operating on Memory views");
-                return;
-            }
+            bool exclusiveSamples = (bool)e.Parameter;
 
             bool[] sampleSet;
             string sampleSetName;
-            if (GetSamplesForSelection(out sampleSet, out sampleSetName))
+
+            if (GetSamplesForSelection(exclusiveSamples, out sampleSet, out sampleSetName)) // TODO: VERIFY that the condition is correct (no ! )
                 return;
 
+            var asMemoryStackSource = (MemoryGraphStackSource)m_stackSource;
             int count = 0;
             List<NodeIndex> nodeIdxs = new List<NodeIndex>();
             for (int i = 0; i < sampleSet.Length; i++)
@@ -1100,21 +1035,19 @@ namespace PerfView
 
         private void DoViewObjects(object sender, ExecutedRoutedEventArgs e)
         {
-            var asMemoryStackSource = m_stackSource as MemoryGraphStackSource;
-            if (asMemoryStackSource == null)
-            {
-                StatusBar.LogError("View Objects only works when operating on Memory views");
-                return;
-            }
+            bool exclusiveSamples = (e.Parameter != null && (bool)e.Parameter)
+                || e.Command == ViewObjectsExclusiveCommand; // for shortcuts there is no parameter, so we check the command
+
+            var asMemoryStackSource = (MemoryGraphStackSource)m_stackSource;
 
             List<NodeIndex> nodeIdxs = null;
             int nodeCount = 0;
-            var cells = SelectedCells();
+            var cells = GetSelectedNodes();
             if (cells != null && 0 < cells.Count)
             {
                 bool[] sampleSet;
                 string sampleSetName;
-                if (!GetSamplesForSelection(out sampleSet, out sampleSetName))
+                if (!GetSamplesForSelection(exclusiveSamples, out sampleSet, out sampleSetName))
                     return;
 
                 nodeIdxs = new List<NodeIndex>();
@@ -1131,12 +1064,17 @@ namespace PerfView
             objectViewer.Show();
         }
 
-        // Context Menu ETWCommands
+        private void CanExecuteSamplesBasedOperation(object sender, CanExecuteRoutedEventArgs e)
+            => e.CanExecute = !CallerCalleeTab.IsSelected /* TODO FIX NOW make this work. */ && GetSelectedNodes().Any();
+
         private void DoDrillInto(object sender, ExecutedRoutedEventArgs e)
         {
+            bool exclusiveSamples = (e.Parameter != null && (bool)e.Parameter)
+                || e.Command == DrillIntoExclusiveCommand; // for shortcuts there is no parameter, so we check the command
+
             bool[] sampleSet;
             string sampleSetName;
-            if (!GetSamplesForSelection(out sampleSet, out sampleSetName))
+            if (!GetSamplesForSelection(exclusiveSamples, out sampleSet, out sampleSetName))
                 return;
 
             var drillIntoSamples = new CopyStackSource(m_stackSource);
@@ -1154,8 +1092,10 @@ namespace PerfView
 
         private void DoFlatten(object sender, ExecutedRoutedEventArgs e)
         {
+            bool exclusiveSamples = (bool)e.Parameter;
+
             var origStackSource = new FilterStackSource(Filter, m_stackSource, ScalingPolicy);
-            var stackSource = Flatten(origStackSource, GetSelectedSamples());
+            var stackSource = Flatten(origStackSource, GetSelectedSamples(exclusiveSamples));
             var newStackWindow = new StackWindow(this, this);
             newStackWindow.ExcludeRegExTextBox.Text = "";
             newStackWindow.IncludeRegExTextBox.Text = "";
@@ -1166,11 +1106,11 @@ namespace PerfView
             newStackWindow.SetStackSource(stackSource);
         }
 
-        private IEnumerable<StackSourceSample> GetSelectedSamples()
+        private IEnumerable<StackSourceSample> GetSelectedSamples(bool exclusiveSamples)
         {
             bool[] sampleSet;
             string sampleSetName;
-            if (GetSamplesForSelection(out sampleSet, out sampleSetName))
+            if (GetSamplesForSelection(exclusiveSamples, out sampleSet, out sampleSetName))
             {
                 for (int i = 0; i < sampleSet.Length; i++)
                 {
@@ -1228,81 +1168,100 @@ namespace PerfView
         {
             FindTextBox.Focus();
         }
+
+        private void SingleNodeIsSelected(object sender, CanExecuteRoutedEventArgs e) => e.CanExecute = GetSelectedNodes().Count == 1;
+
         private void DoFindInByName(object sender, ExecutedRoutedEventArgs e)
         {
-            string str = SelectedCellStringValue();
-            if (str != null)
-                FindByName(str);
-            else
-                StatusBar.LogError("No selected cells found.");
+            var displayName = GetSelectedNodes().Single().DisplayName;
+
+            for (int i = 0; i < m_byNameView.Count; i++)
+            {
+                var item = m_byNameView[i];
+                if (displayName == item.DisplayName)
+                {
+                    ByNameDataGrid.Grid.SelectedIndex = i;
+                    // Hack!  Wait for items to be populated
+                    try
+                    {
+                        ByNameDataGrid.Grid.ScrollIntoView(item);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine("Caught Exception while scrolling " + ex.ToString());
+                    }
+                    ByNameTab.IsSelected = true;
+                    return;
+                }
+            }
         }
+
         private void DoFindInCallTreeName(object sender, ExecutedRoutedEventArgs e)
         {
-            string str = SelectedCellStringValue();
-            if (str != null)
-            {
-                CallTreeTab.IsSelected = true;
-                // TODO support some sort of escape sequence 
-                Find(Regex.Escape(str));
-            }
-            else
-                StatusBar.LogError("No selected cells found.");
+            var displayName = Regex.Escape(GetSelectedNodes().Single().DisplayName);
+
+            CallTreeTab.IsSelected = true;
+            FindTextBox.Text = displayName; // F3 support
+            CallTreeView.Find(displayName); // find the first match
         }
+
         private void DoViewInCallerCallee(object sender, RoutedEventArgs e)
         {
-            if (SetFocusNodeToSelection())
-                CallerCalleeTab.IsSelected = true;
+            SetFocus(GetSelectedNodes().Single());
+            CallerCalleeTab.IsSelected = true;
         }
         private void DoViewInCallers(object sender, ExecutedRoutedEventArgs e)
         {
-            if (SetFocusNodeToSelection())
-                CallersTab.IsSelected = true;
+            SetFocus(GetSelectedNodes().Single());
+            CallersTab.IsSelected = true;
         }
         private void DoViewInCallees(object sender, ExecutedRoutedEventArgs e)
         {
-            if (SetFocusNodeToSelection())
-                CalleesTab.IsSelected = true;
+            SetFocus(GetSelectedNodes().Single());
+            CalleesTab.IsSelected = true;
         }
 
-        private void DoEntryGroupModule(object sender, ExecutedRoutedEventArgs e)
-        {
-            DoGroupModuleHelper("=>");
-        }
-        private void DoGroupModule(object sender, ExecutedRoutedEventArgs e)
-        {
-            DoGroupModuleHelper("->");
-        }
+        private void HasNonEmptySelection(object sender, CanExecuteRoutedEventArgs e) => e.CanExecute = GetSelectedNodes().Any();
+
+        private void DoEntryGroupModule(object sender, ExecutedRoutedEventArgs e) => DoGroupModuleHelper("=>");
+
+        private void DoGroupModule(object sender, ExecutedRoutedEventArgs e) => DoGroupModuleHelper("->");
+
         private void DoGroupModuleHelper(string op)
         {
             var str = GroupRegExTextBox.Text;
             var badStrs = "";
-            foreach (string cellStr in SelectedCellsStringValue())
+            foreach (var node in GetSelectedNodes())
             {
-                Match m = Regex.Match(cellStr, @"\b([\w.]*?)!");
-                if (m.Success)
+                Match moduleNameMatch = Regex.Match(node.DisplayName, @"\b([\w.]*?)!");
+                if (moduleNameMatch.Success)
                 {
-                    var groupPat = FilterParams.EscapeRegEx(m.Groups[1].Value) + "!" + op + m.Groups[1].Value;
+                    var groupPat = FilterParams.EscapeRegEx(moduleNameMatch.Groups[1].Value) + "!" + op + moduleNameMatch.Groups[1].Value;
                     str = AddSet(groupPat, str);
                 }
                 else
                 {
                     if (badStrs.Length > 0)
                         badStrs += " ";
-                    badStrs += cellStr;
+                    badStrs += node.DisplayName;
                 }
             }
             if (badStrs.Length > 0)
                 StatusBar.LogError("Could not find a module pattern in text " + badStrs + ".");
-            GroupRegExTextBox.Text = str;
-            Update();
+
+            if (GroupRegExTextBox.Text != str)
+            {
+                GroupRegExTextBox.Text = str;
+                Update();
+            }
         }
         private void DoUngroup(object sender, ExecutedRoutedEventArgs e)
         {
             bool matchedSomething = false;
-            foreach (string cellStr in SelectedCellsStringValue())
+            foreach (var node in GetSelectedNodes())
             {
                 // Is it an entry point group? 
-                var match = Regex.Match(cellStr, "<<(.*)>>");
+                var match = Regex.Match(node.DisplayName, "<<(.*)>>");
                 if (match.Success)
                 {
                     var ungroupPat = match.Groups[1].Value;
@@ -1336,7 +1295,7 @@ namespace PerfView
                                 var group = match.Groups[3].Value;
                                 // (?<V1>.*) is .NET syntax that names the group V1
                                 var groupPat = Regex.Replace(group, @"\$(\d)", "(?<V$1>.*)");
-                                match = Regex.Match(cellStr, groupPat);
+                                match = Regex.Match(node.DisplayName, groupPat);
                                 if (match.Success)
                                 {
                                     matchedSomething = true;
@@ -1379,39 +1338,30 @@ namespace PerfView
                 StatusBar.LogError("Cell does not have the pattern that can be ungrouped.");
         }
 
-        private void DoRaiseItemPriority(object sender, ExecutedRoutedEventArgs e)
-        {
-            ChangePriority(1, false);
-        }
-        private void DoLowerItemPriority(object sender, ExecutedRoutedEventArgs e)
-        {
-            ChangePriority(-1, false);
-        }
-        private void DoRaiseModulePriority(object sender, ExecutedRoutedEventArgs e)
-        {
-            ChangePriority(1, true);
-        }
-        private void DoLowerModulePriority(object sender, ExecutedRoutedEventArgs e)
-        {
-            ChangePriority(-1, true);
-        }
+        private void CanChangePriority(object sender, CanExecuteRoutedEventArgs e) => e.CanExecute = PriorityTextBox.IsVisible && GetSelectedNodes().Any();
+
+        private void DoRaiseItemPriority(object sender, ExecutedRoutedEventArgs e) => ChangePriority(1, module: false);
+        private void DoLowerItemPriority(object sender, ExecutedRoutedEventArgs e) => ChangePriority(-1, module: false);
+        private void DoRaiseModulePriority(object sender, ExecutedRoutedEventArgs e) => ChangePriority(1, module: true);
+        private void DoLowerModulePriority(object sender, ExecutedRoutedEventArgs e) => ChangePriority(-1, module: true);
+
         private void ChangePriority(int delta, bool module)
         {
             var priorities = PriorityTextBox.Text;
             var badStrs = "";
-            foreach (string cellStr in SelectedCellsStringValue())
+            foreach (var node in GetSelectedNodes())
             {
-                string str = Regex.Replace(cellStr, @"\s+\[\w.*?\]\s*$", "");   // Remove any [] at the end 
+                string str = Regex.Replace(node.DisplayName, @"\s+\[\w.*?\]\s*$", "");   // Remove any [] at the end 
                 if (module)
                 {
-                    Match m = Regex.Match(cellStr, @"\b([\w.]*?)!");
+                    Match m = Regex.Match(node.DisplayName, @"\b([\w.]*?)!");
                     if (m.Success)
                         str = m.Groups[1].Value + "!";
                     else
                     {
                         if (badStrs.Length > 0)
                             badStrs += " ";
-                        badStrs += cellStr;
+                        badStrs += node.DisplayName;
                     }
                 }
 
@@ -1469,15 +1419,15 @@ namespace PerfView
         private void DoUngroupModule(object sender, ExecutedRoutedEventArgs e)
         {
             bool matchedSomething = false;
-            foreach (string cellStr in SelectedCellsStringValue())
+            foreach (var node in GetSelectedNodes())
             {
                 string module = null;
-                var match = Regex.Match(cellStr, @"([\w.]+)!");
+                var match = Regex.Match(node.DisplayName, @"([\w.]+)!");
                 if (match.Success)
                     module = match.Groups[1].Value;
                 else
                 {
-                    match = Regex.Match(cellStr, @"module (\S+)");
+                    match = Regex.Match(node.DisplayName, @"module (\S+)");
                     if (match.Success)
                         module = match.Groups[1].Value;
                 }
@@ -1512,8 +1462,8 @@ namespace PerfView
         private void DoFoldItem(object sender, ExecutedRoutedEventArgs e)
         {
             var str = FoldRegExTextBox.Text;
-            foreach (string cellStr in SelectedCellsStringValue())
-                str = AddSet(str, FilterParams.EscapeRegEx(cellStr));        // TODO need a good anchor
+            foreach (var node in GetSelectedNodes())
+                str = AddSet(str, FilterParams.EscapeRegEx(node.DisplayName));        // TODO need a good anchor
             FoldRegExTextBox.Text = str;
             Update();
         }
@@ -1527,108 +1477,73 @@ namespace PerfView
         {
             Clipboard.SetText(StartTextBox.Text + " " + EndTextBox.Text);
         }
-        private void CanDoOpenEvents(object sender, CanExecuteRoutedEventArgs e)
-        {
-            e.CanExecute = false;
-            var asETLData = DataSource.DataFile as ETLPerfViewData;
-            if (asETLData != null)
-                e.CanExecute = true;
-        }
+        private void CanDoOpenEvents(object sender, CanExecuteRoutedEventArgs e) 
+            => e.CanExecute = DataSource.DataFile is ETLPerfViewData && DataSource.DataFile.Children.OfType<PerfViewEventSource>().Any() && GetSelectedNodes().Any();
+
         private void DoOpenEvents(object sender, ExecutedRoutedEventArgs e)
         {
-            var cells = SelectedCells();
-            if (cells != null && (cells.Count == 1 || cells.Count == 2))
+            var selectedNodes = GetSelectedNodes();
+            var start = selectedNodes.Min(node => node.FirstTimeRelativeMSec).ToString("n3");
+            var end = selectedNodes.Max(node => node.LastTimeRelativeMSec).ToString("n3");
+
+            var eventSource = DataSource.DataFile.Children.OfType<PerfViewEventSource>().First();
+
+            eventSource.Open(ParentWindow, StatusBar, delegate
             {
-                var start = GetCellStringValue(cells[0]);
-                var end = start;
-                if (cells.Count == 2)
-                    end = GetCellStringValue(cells[1]);
+                var viewer = eventSource.Viewer;
+                viewer.StartTextBox.Text = start;
+                viewer.EndTextBox.Text = end;
+                viewer.EventTypes.SelectAll();
+                viewer.Update();
+            });
+        }
 
-                double dummy;
-                if (!double.TryParse(start, out dummy) || !double.TryParse(end, out dummy))
-                {
-                    StatusBar.LogError("Could not parse cells as a time range.");
-                    return;
-                }
+        private void CanSetTimeRange(object sender, CanExecuteRoutedEventArgs e)
+            => e.CanExecute = GetSelectedNodes().Any() || TextBoxHasFocusAndNonEmptySelection(out var _);
 
-                PerfViewEventSource eventSource = null;
-                foreach (var child in DataSource.DataFile.Children)
-                {
-                    eventSource = child as PerfViewEventSource;
-                    if (eventSource != null)
-                        break;
-                }
-                if (eventSource == null)
-                {
-                    StatusBar.Log("This data file does not support the Events view");
-                    return;
-                }
+        private bool TextBoxHasFocusAndNonEmptySelection(out TextBox focusTextBox)
+        {
+            focusTextBox = Keyboard.FocusedElement as TextBox;
+            if (focusTextBox == null && PerfDataGrid.EditingBox != null && PerfDataGrid.EditingBox.IsFocused)
+                focusTextBox = PerfDataGrid.EditingBox;
 
-                eventSource.Open(ParentWindow, StatusBar, delegate
-                {
-                    var viewer = eventSource.Viewer;
-                    viewer.StartTextBox.Text = start;
-                    viewer.EndTextBox.Text = end;
-                    viewer.EventTypes.SelectAll();
-                    viewer.Update();
-                });
-
-            }
-            else
-                StatusBar.LogError("You must select one or two cells to act as the focus region.");
+            return focusTextBox != null && focusTextBox.SelectionLength != 0;
         }
 
         private void DoSetTimeRange(object sender, ExecutedRoutedEventArgs e)
         {
-            var focusTextBox = Keyboard.FocusedElement as TextBox;
-            if (focusTextBox == null && PerfDataGrid.EditingBox != null && PerfDataGrid.EditingBox.IsFocused)
-                focusTextBox = PerfDataGrid.EditingBox;
-
-            if (focusTextBox != null)
+            if (TextBoxHasFocusAndNonEmptySelection(out var focusTextBox))
             {
-                if (focusTextBox.SelectionLength != 0)
+                var selectionStartIndex = focusTextBox.SelectionStart;
+                var selectionLen = focusTextBox.SelectionLength;
+                var text = focusTextBox.Text;
+
+                // If you accidently select the space before the selection, skip it
+                if (0 <= selectionStartIndex && selectionStartIndex < text.Length && text[selectionStartIndex] == ' ')
+                    selectionStartIndex++;
+
+                // grab the last 32 bytes of the string.  
+                var histStart = text.Length - CallTree.TimeHistogramController.BucketCount;
+                if (histStart >= 0)
                 {
-                    var selectionStartIndex = focusTextBox.SelectionStart;
-                    var selectionLen = focusTextBox.SelectionLength;
-                    var text = focusTextBox.Text;
-
-                    // If you accidently select the space before the selection, skip it
-                    if (0 <= selectionStartIndex && selectionStartIndex < text.Length && text[selectionStartIndex] == ' ')
-                        selectionStartIndex++;
-
-                    // grab the last 32 bytes of the string.  
-                    var histStart = text.Length - CallTree.TimeHistogramController.BucketCount;
-                    if (histStart >= 0)
+                    var histStr = text.Substring(histStart);
+                    if (Regex.IsMatch(histStr, @"^[_*\w.]") && selectionStartIndex >= histStart)
                     {
-                        var histStr = text.Substring(histStart);
-                        if (Regex.IsMatch(histStr, @"^[_*\w.]") && selectionStartIndex >= histStart)
-                        {
-                            var bucketStartIndex = (HistogramCharacterIndex)(selectionStartIndex - histStart);
-                            var bucketEndIndex = (HistogramCharacterIndex)(bucketStartIndex + selectionLen);
+                        var bucketStartIndex = (HistogramCharacterIndex)(selectionStartIndex - histStart);
+                        var bucketEndIndex = (HistogramCharacterIndex)(bucketStartIndex + selectionLen);
 
-                            StartTextBox.Text = CallTree.TimeHistogramController.GetStartTimeForBucket(bucketStartIndex).ToString("n3");
-                            EndTextBox.Text = CallTree.TimeHistogramController.GetStartTimeForBucket(bucketEndIndex).ToString("n3");
-                            Update();
-                        }
+                        StartTextBox.Text = CallTree.TimeHistogramController.GetStartTimeForBucket(bucketStartIndex).ToString("n3");
+                        EndTextBox.Text = CallTree.TimeHistogramController.GetStartTimeForBucket(bucketEndIndex).ToString("n3");
+                        Update();
                     }
-                    return;
                 }
+                return;
             }
 
-            var cells = SelectedCells();
-            if (cells != null)
-            {
-                var callTreeNodes = cells.Select(cell => cell.Item).OfType<CallTreeNodeBase>();
-
-                if (callTreeNodes.Any())
-                {
-                    StartTextBox.Text = callTreeNodes.Min(node => node.FirstTimeRelativeMSec).ToString("n3");
-                    EndTextBox.Text = callTreeNodes.Max(node => node.LastTimeRelativeMSec).ToString("n3");
-                    Update();
-                }
-                else
-                    StatusBar.LogError("Could not set time range.");
-            }
+            var callTreeNodes = GetSelectedNodes();
+            StartTextBox.Text = callTreeNodes.Min(node => node.FirstTimeRelativeMSec).ToString("n3");
+            EndTextBox.Text = callTreeNodes.Max(node => node.LastTimeRelativeMSec).ToString("n3");
+            Update();
         }
 
         // Scenario-related stuff
@@ -1770,12 +1685,12 @@ namespace PerfView
         {
             // Add a | operator between all the values 
             var incPat = "";
-            foreach (string cellStr in SelectedCellsStringValue())
+            foreach (var node in GetSelectedNodes())
             {
                 if (incPat.Length != 0)
                     incPat += "|";
 
-                var pat = cellStr;
+                var pat = node.DisplayName;
                 if (pat.IndexOf('!') < 0)
                     pat = "^" + pat;
                 incPat += FilterParams.EscapeRegEx(pat);
@@ -1787,9 +1702,9 @@ namespace PerfView
         private void DoExcludeItem(object sender, ExecutedRoutedEventArgs e)
         {
             var str = ExcludeRegExTextBox.Text;
-            foreach (string cellStr in SelectedCellsStringValue())
+            foreach (var node in GetSelectedNodes())
             {
-                var pat = cellStr;
+                var pat = node.DisplayName;
                 if (pat.IndexOf('!') < 0)
                     pat = "^" + pat;
                 str = AddSet(str, FilterParams.EscapeRegEx(pat));
@@ -1933,7 +1848,6 @@ namespace PerfView
                     log.WriteLine("Error looking up " + moduleToLookup + "\r\n    " + ex.Message);
                 }
             }
-
         }
 
         private void DoLookupSymbols(object sender, ExecutedRoutedEventArgs e)
@@ -1959,7 +1873,6 @@ namespace PerfView
                 StatusBar.LogError("Symbol lookup for Diff not supported.  You must look up symbols before doing the diff.");
                 return;
             }
-
 
             // Look them up.
             StatusBar.StartWork("Symbol Lookup", delegate ()
@@ -1988,19 +1901,9 @@ namespace PerfView
         }
         private void DoGotoSource(object sender, ExecutedRoutedEventArgs e)
         {
-            var cells = SelectedCells();
-            if (cells == null || cells.Count == 0)
-            {
-                StatusBar.LogError("No cells selected.");
-                return;
-            }
-            if (cells.Count != 1)
-            {
-                StatusBar.LogError("More than one cell selected.");
-                return;
-            }
-            var cell = cells[0];
-            var cellText = GetCellStringValue(cell);
+            var asCallTreeNodeBase = GetSelectedNodes().Single();
+            var cellText = asCallTreeNodeBase.DisplayName;
+
             if (cellText.EndsWith("!?"))
             {
                 StatusBar.LogError("You must lookup symbols before looking up source.");
@@ -2010,19 +1913,6 @@ namespace PerfView
             {
                 StatusBar.LogError("Source lookup only works on cells of the form dll!method.");
                 return;
-            }
-            var item = cell.Item;
-            var asCallTreeNodeBase = item as CallTreeNodeBase;
-            if (asCallTreeNodeBase == null)
-            {
-                var asCallTreeViewNode = item as CallTreeViewNode;
-                if (asCallTreeViewNode != null)
-                    asCallTreeNodeBase = asCallTreeViewNode.Data;
-                else
-                {
-                    StatusBar.LogError("Could not find data item.");
-                    return;
-                }
             }
 
             StatusBar.StartWork("Fetching Source code for " + cellText, delegate ()
@@ -2280,146 +2170,70 @@ namespace PerfView
             }
         }
 
-        private void DoExpandAll(object sender, ExecutedRoutedEventArgs e)
-        {
-            CallTreeViewNode selectedNode = null;
-            if (CallTreeTab.IsSelected)
-                selectedNode = CallTreeView.SelectedNode;
-            else if (CallersTab.IsSelected)
-                selectedNode = m_callersView.SelectedNode;
-            else if (CalleesTab.IsSelected)
-                selectedNode = m_calleesView.SelectedNode;
+        private void CallTreeNodeIsSelected(object sender, CanExecuteRoutedEventArgs e) => e.CanExecute = GetSelectedCallTreeNode() != null;
 
-            if (selectedNode != null)
-                selectedNode.ExpandToDepth(int.MaxValue, selectExpandedNode: false); // we don't want to select every node while expanding, it takes too much time
+        private CallTreeViewNode GetSelectedCallTreeNode()
+        {
+            if (CallTreeTab.IsSelected)
+                return CallTreeView.SelectedNode;
+            else if (CallersTab.IsSelected)
+                return m_callersView.SelectedNode;
+            else if (CalleesTab.IsSelected)
+                return m_calleesView.SelectedNode;
+
+            return null;
         }
+
+        private void DoExpandAll(object sender, ExecutedRoutedEventArgs e)
+            => GetSelectedCallTreeNode().ExpandToDepth(int.MaxValue, selectExpandedNode: false); // we don't want to select every node while expanding, it takes too much time
 
         private void DoExpand(object sender, ExecutedRoutedEventArgs e)
         {
-            CallTreeViewNode selectedNode = null;
-            CallTreeView view = null;
-            if (CallTreeTab.IsSelected)
-                view = CallTreeView;
-            else if (CallersTab.IsSelected)
-                view = m_callersView;
-            else if (CalleesTab.IsSelected)
-                view = m_calleesView;
-
-            if (view != null)
+            CallTreeViewNode selectedNode = GetSelectedCallTreeNode();
+            for (; ; )
             {
-                selectedNode = view.SelectedNode;
-                if (selectedNode != null)
+                if (!selectedNode.IsExpanded)
                 {
-                    for (; ; )
-                    {
-                        if (!selectedNode.IsExpanded)
-                        {
-                            selectedNode.IsExpanded = true;
-                            break;
-                        }
-
-                        var children = selectedNode.VisibleChildren;
-                        if (children.Count < 1)
-                            break;
-                        selectedNode = children[0];
-                    }
+                    selectedNode.IsExpanded = true;
+                    break;
                 }
+
+                var children = selectedNode.VisibleChildren;
+                if (children.Count < 1)
+                    break;
+                selectedNode = children[0];
             }
         }
 
-        private void DoCollapse(object sender, ExecutedRoutedEventArgs e)
-        {
-            CallTreeViewNode selectedNode = null;
-            CallTreeView view = null;
-            if (CallTreeTab.IsSelected)
-                view = CallTreeView;
-            else if (CallersTab.IsSelected)
-                view = m_callersView;
-            else if (CalleesTab.IsSelected)
-                view = m_calleesView;
+        private void DoCollapse(object sender, ExecutedRoutedEventArgs e) => GetSelectedCallTreeNode().IsExpanded = false;
 
-            if (view != null)
-            {
-                selectedNode = view.SelectedNode;
-                if (selectedNode != null)
-                    selectedNode.IsExpanded = false;
-            }
+        private void DoSetBackgroundColor(object sender, ExecutedRoutedEventArgs e)
+        {
+            System.Drawing.Color color = System.Drawing.Color.FromName((string)e.Parameter);
+
+            var selectedNode = GetSelectedCallTreeNode();
+            selectedNode.BackgroundColor = color.Name;
         }
 
-        private void CanExpand(object sender, CanExecuteRoutedEventArgs e)
-        {
-            e.CanExecute = (CallTreeTab.IsSelected && CallTreeView.SelectedNode != null) ||
-                           (CallersTab.IsSelected && m_callersView.SelectedNode != null) ||
-                           (CalleesTab.IsSelected && m_calleesView.SelectedNode != null);
-        }
+        private void DoFoldPercent(object sender, ExecutedRoutedEventArgs e) => FoldPercentTextBox.Focus();
 
-        private void DoSetBrownBackgroundColor(object sender, ExecutedRoutedEventArgs e)
-        {
-            DoSetBackgroundColor(sender, e, System.Drawing.Color.BurlyWood);
-        }
-
-        private void DoSetBlueBackgroundColor(object sender, ExecutedRoutedEventArgs e)
-        {
-            DoSetBackgroundColor(sender, e, System.Drawing.Color.LightSkyBlue);
-        }
-
-        private void DoSetRedBackgroundColor(object sender, ExecutedRoutedEventArgs e)
-        {
-            DoSetBackgroundColor(sender, e, System.Drawing.Color.Coral);
-        }
-
-        private void DoSetBackgroundColor(object sender, ExecutedRoutedEventArgs e, System.Drawing.Color color)
-        {
-            CallTreeViewNode selectedNode = null;
-            CallTreeView view = null;
-            if (CallTreeTab.IsSelected)
-                view = CallTreeView;
-            else if (CallersTab.IsSelected)
-                view = m_callersView;
-            else if (CalleesTab.IsSelected)
-                view = m_calleesView;
-
-            if (view != null)
-            {
-                selectedNode = view.SelectedNode;
-                if (selectedNode != null)
-                {
-                    selectedNode.SetBackgroundColor(color);
-                    view.m_perfGrid.Grid.Items.Refresh();
-                }
-            }
-        }
-
-        private void CanSetBackgroundColor(object sender, CanExecuteRoutedEventArgs e)
-        {
-            e.CanExecute = (CallTreeTab.IsSelected && CallTreeView.SelectedNode != null) ||
-                           (CallersTab.IsSelected && m_callersView.SelectedNode != null) ||
-                           (CalleesTab.IsSelected && m_calleesView.SelectedNode != null);
-        }
-
-        private void DoFoldPercent(object sender, ExecutedRoutedEventArgs e)
-        {
-            FoldPercentTextBox.Focus();
-        }
         private void DoIncreaseFoldPercent(object sender, ExecutedRoutedEventArgs e)
         {
-            float newVal;
-            if (float.TryParse(FoldPercentTextBox.Text, out newVal))
+            if (float.TryParse(FoldPercentTextBox.Text, out float newVal))
+            {
                 FoldPercentTextBox.Text = (newVal * 1.6).ToString("f2");
-            Update();
+                Update();
+            }
         }
         private void DoDecreaseFoldPercent(object sender, ExecutedRoutedEventArgs e)
         {
-            float newVal;
-            if (float.TryParse(FoldPercentTextBox.Text, out newVal))
+            if (float.TryParse(FoldPercentTextBox.Text, out float newVal))
+            {
                 FoldPercentTextBox.Text = (newVal / 1.6).ToString("f2");
-            Update();
+                Update();
+            }
         }
-        // turns off menus for options that only make sence in the callTree view.  
-        private void InCallTree(object sender, CanExecuteRoutedEventArgs e)
-        {
-            e.CanExecute = CallTreeTab.IsSelected;
-        }
+
         private void DoHyperlinkHelp(object sender, ExecutedRoutedEventArgs e)
         {
             var param = e.Parameter as string;
@@ -2462,30 +2276,6 @@ namespace PerfView
 
             StatusBar.Log("Displaying Users Guide in Web Browser.");
             MainWindow.DisplayUsersGuide(param);
-        }
-
-        /// <summary>
-        /// Sets the focus node to the currently selected cell, returns true if successful.  
-        /// </summary>
-        /// <returns></returns>
-        private bool SetFocusNodeToSelection()
-        {
-            var str = SelectedCellStringValue();
-            if (str != null)
-            {
-                // if it looks like a number, don't event try, just ignore 
-                if (Regex.IsMatch(str, @"^[_\d,.]*$"))
-                    return false;
-
-                if (!SetFocus(str))
-                    return true;
-                return true;
-            }
-            else
-            {
-                StatusBar.LogError("No selected cells found.");
-                return true;
-            }
         }
 
         private void ByName_MouseDoubleClick(object sender, MouseButtonEventArgs e)
@@ -2633,7 +2423,12 @@ namespace PerfView
 
             var result = saveDialog.ShowDialog();
             if (result == true)
+            {
+                if (FlameGraphCanvas.IsEmpty || m_RedrawFlameGraphWhenItBecomesVisible)
+                    RedrawFlameGraph();
+
                 FlameGraph.Export(FlameGraphCanvas, saveDialog.FileName);
+            }
         }
 
         private TabItem SelectedTab
@@ -2776,9 +2571,13 @@ namespace PerfView
             new InputGestureCollection() { new KeyGesture(Key.F5) });
         public static RoutedUICommand NewWindowCommand = new RoutedUICommand("New Window", "NewWindow", typeof(StackWindow),
             new InputGestureCollection() { new KeyGesture(Key.N, ModifierKeys.Control) });
-        public static RoutedUICommand DrillIntoCommand = new RoutedUICommand("Drill Into", "DrillInto", typeof(StackWindow),
+        public static RoutedUICommand DrillIntoInclusiveCommand = new RoutedUICommand("Drill Into Inclusive Samples", "DrillIntoInclusive", typeof(StackWindow),
             new InputGestureCollection() { new KeyGesture(Key.D, ModifierKeys.Control) });
+        public static RoutedUICommand DrillIntoExclusiveCommand = new RoutedUICommand("Drill Into Exclusive Samples", "DrillIntoExclusive", typeof(StackWindow),
+            new InputGestureCollection() { new KeyGesture(Key.D, ModifierKeys.Control | ModifierKeys.Shift) });
+
         public static RoutedUICommand FlattenCommand = new RoutedUICommand("Flatten", "Flatten", typeof(StackWindow));
+
         public static RoutedUICommand FindCommand = new RoutedUICommand("Find", "Find", typeof(StackWindow),
             new InputGestureCollection() { new KeyGesture(Key.F, ModifierKeys.Control) });
         public static RoutedUICommand FindNextCommand = new RoutedUICommand("Find Next", "FindNext", typeof(StackWindow),
@@ -2854,8 +2653,10 @@ namespace PerfView
         public static RoutedUICommand ToggleNoPadOnCopyCommand = new RoutedUICommand("Toggle No Pad On Copy", "ToggleNoPadOnCopy", typeof(StackWindow));
 
         // memory
-        public static RoutedUICommand ViewObjectsCommand = new RoutedUICommand("View Objects", "ViewObjects", typeof(StackWindow),
+        public static RoutedUICommand ViewObjectsInclusiveCommand = new RoutedUICommand("View Objects Inclusive Samples", "ViewObjectsInclusive", typeof(StackWindow),
             new InputGestureCollection() { new KeyGesture(Key.O, ModifierKeys.Alt) });
+        public static RoutedUICommand ViewObjectsExclusiveCommand = new RoutedUICommand("View Objects Exclusive Samples", "ViewObjectsExclusive", typeof(StackWindow),
+            new InputGestureCollection() { new KeyGesture(Key.O, ModifierKeys.Alt | ModifierKeys.Shift) });
         public static RoutedUICommand DumpObjectCommand = new RoutedUICommand("Dump Object", "DumpObject", typeof(StackWindow));
 
 
@@ -2872,9 +2673,7 @@ namespace PerfView
             new InputGestureCollection() { new KeyGesture(Key.Space) });
         public static RoutedUICommand CollapseCommand = new RoutedUICommand("Collapse", "Collapse", typeof(StackWindow),
             new InputGestureCollection() { new KeyGesture(Key.Space, ModifierKeys.Shift) });
-        public static RoutedUICommand SetBrownBackgroundColorCommand = new RoutedUICommand("Set Brown Background Color", "SetBrownBackgroundColor", typeof(StackWindow)); 
-        public static RoutedUICommand SetBlueBackgroundColorCommand = new RoutedUICommand("Set Blue Background Color", "SetBlueBackgroundColor", typeof(StackWindow)); 
-        public static RoutedUICommand SetRedBackgroundColorCommand = new RoutedUICommand("Set Red Background Color", "SetRedBackgroundColor", typeof(StackWindow));
+        public static RoutedUICommand SetBackgroundColorCommand = new RoutedUICommand("Set Background Color", "SetBackgroundColor", typeof(StackWindow));
         public static RoutedUICommand FoldPercentCommand = new RoutedUICommand("Fold %", "FoldPercent", typeof(StackWindow),
             new InputGestureCollection() { new KeyGesture(Key.F6) });
         public static RoutedUICommand IncreaseFoldPercentCommand = new RoutedUICommand("Increase Fold %", "Increase FoldPercent", typeof(StackWindow),
@@ -3130,21 +2929,21 @@ namespace PerfView
         {
             // TODO see if we can use this in as many places as possible. 
             var badStrs = "";
-            foreach (string cellStr in SelectedCellsStringValue())
+            foreach (var node in GetSelectedNodes())
             {
-                Match m = Regex.Match(cellStr, @"([ \w.-]+)!");
+                Match m = Regex.Match(node.DisplayName, @"([ \w.-]+)!");
                 if (m.Success)
                     moduleAction(m.Groups[1].Value);
                 else
                 {
-                    m = Regex.Match(cellStr, @"^module ([ \w.-]+)");
+                    m = Regex.Match(node.DisplayName, @"^module ([ \w.-]+)");
                     if (m.Success)
                         moduleAction(m.Groups[1].Value);
                     else
                     {
                         if (badStrs.Length > 0)
                             badStrs += " ";
-                        badStrs += cellStr;
+                        badStrs += node.DisplayName;
                     }
                 }
             }
@@ -3160,7 +2959,6 @@ namespace PerfView
         /// This is and ugly routine that scrapes the data to find the full path (without the .exe extension) of the
         /// exe in the program.   It may fail (return nulls).   
         /// </summary>
-
         private static string FindExeName(string incPat)
         {
             string procName = null;
@@ -3287,26 +3085,38 @@ namespace PerfView
             return ret;
         }
 
-        internal static string GetCellStringValue(DataGridCellInfo cell)
+        private readonly static CallTreeNodeBase[] _emptyNodes = new CallTreeNodeBase[0];
+
+        private IReadOnlyList<CallTreeNodeBase> GetSelectedNodes()
         {
-            string ret = PerfDataGrid.GetCellStringValue(cell);
-            ret = Regex.Replace(ret, @"\s*\{.*?\}\s*$", "");        // Remove {} stuff at the end.  
-            ret = Regex.Replace(ret, @"^[ |+]*", "");               // Remove spaces or | (for tree view) at the start).  
-            return ret;
-        }
-        private IList<DataGridCellInfo> SelectedCells()
-        {
+            if (FlameGraphTab.IsSelected)
+            {
+                if (FlameGraphCanvas.SelectedNode != null)
+                    return new[] { FlameGraphCanvas.SelectedNode };
+
+                return _emptyNodes;
+            }
+
             var dataGrid = GetDataGrid();
-            if (dataGrid == null)
-                return null;
-            return dataGrid.SelectedCells;
+            if (dataGrid != null)
+            {
+                var nodes = new List<CallTreeNodeBase>(dataGrid.SelectedCells.Count);
+                foreach (var cell in dataGrid.SelectedCells)
+                    if (cell.Item is CallTreeNodeBase nodeBase) // ByName, Caller-Callee
+                        nodes.Add(nodeBase);
+                    else if (cell.Item is CallTreeViewNode callTreeNode) // all tree-like views
+                        nodes.Add(callTreeNode.Data);
+
+                return nodes.Distinct().ToArray();
+            }
+
+            return _emptyNodes;
         }
-        internal DataGrid GetDataGrid()
+
+        private DataGrid GetDataGrid()
         {
             if (ByNameTab.IsSelected)
-            {
                 return ByNameDataGrid.Grid;
-            }
             else if (CallerCalleeTab.IsSelected)
             {
                 // Find the focus
@@ -3324,78 +3134,15 @@ namespace PerfView
                 return null;
             }
             else if (CallTreeTab.IsSelected)
-            {
                 return CallTreeDataGrid.Grid;
-            }
             else if (CallersTab.IsSelected)
-            {
                 return CallersDataGrid.Grid;
-            }
             else if (CalleesTab.IsSelected)
-            {
                 return CalleesDataGrid.Grid;
-            }
-            else
-            {
-                return null;
-            }
-        }
-        private IEnumerable<string> SelectedCellsStringValue()
-        {
-            var dataGrid = GetDataGrid();
-            if (dataGrid == null)
-                yield break;
-            var cells = dataGrid.SelectedCells;
-            if (cells == null)
-                yield break;
 
-            for (int i = 0; i < cells.Count; i++)
-            {
-                DataGridCellInfo cell = cells[i];
-                var str = GetCellStringValue(cell);
-                if (str.Length != 0)
-                    yield return str;
+            return null;
+        }
 
-                if (StartsFullRow(cells, i, dataGrid.Columns.Count))
-                    i += dataGrid.Columns.Count - 1;
-            }
-        }
-        /// <summary>
-        /// Returns true if the cells starting at 'startIndex' begin a complete full row.  
-        /// </summary>
-        private static bool StartsFullRow(IList<DataGridCellInfo> cells, int startIdx, int numColumns)
-        {
-            if (startIdx + numColumns > cells.Count)
-                return false;
-
-            for (int i = 0; i < numColumns; i++)
-                if (cells[i + startIdx].Column.DisplayIndex != i)
-                    return false;
-            return true;
-        }
-        /// <summary>
-        /// Returns the string value for a single selected cell.  Will return null on error 
-        /// </summary>
-        private string SelectedCellStringValue()
-        {
-            var dataGrid = GetDataGrid();
-            if (dataGrid == null)
-                return null;
-            var cells = dataGrid.SelectedCells;
-            if (cells == null)
-                return null;
-            if (cells.Count == 0)
-                return null;
-            if (cells.Count > 1)
-            {
-                int numCols = dataGrid.Columns.Count;
-                // fail unless we have selected a whole row
-                // TODO should we bother?
-                if (cells.Count != numCols || !StartsFullRow(cells, 0, numCols))
-                    return null;
-            }
-            return GetCellStringValue(cells[0]);
-        }
         // We keep a list of stack windows for use with the 'Diff' feature.  
         public static List<StackWindow> StackWindows = new List<StackWindow>();
 
@@ -3430,18 +3177,7 @@ namespace PerfView
             helpMenuItem.Click += delegate (object sender, RoutedEventArgs e) { MainWindow.DisplayUsersGuide(diffName); };
             diffMenuItem.Items.Add(helpMenuItem);
         }
-        private void CopyTo(ItemCollection toCollection, IEnumerable fromCollection)
-        {
-            toCollection.Clear();
-            foreach (var item in fromCollection)
-                toCollection.Add(item);
-        }
-        private double GetDouble(string value, double defaultValue)
-        {
-            if (value.Length == 0)
-                return defaultValue;
-            return double.Parse(value);
-        }
+
         private static string AddSet(string target, string addend)
         {
             if (target.Length == 0)
@@ -3532,8 +3268,10 @@ namespace PerfView
             else if (cells.Count == 1 && !StatusBar.LoggedError)
             {
                 // We have only one cell copy its contents to the status box
-                string cellStr = StackWindow.GetCellStringValue(cells[0]);
-                string cellContentsToPrint = cellStr;
+                string cellStr = PerfDataGrid.GetCellStringValue(cells[0]);
+                string cellContentsToPrint = Regex.Replace(cellStr, @"\s*\{.*?\}\s*$", ""); // Remove {} stuff at the end.  
+                cellContentsToPrint = Regex.Replace(cellContentsToPrint, @"^[ |+]*", ""); // Remove spaces or | (for tree view) at the start).  
+
                 if (cellStr.Length != 0)
                 {
                     double asNum;
