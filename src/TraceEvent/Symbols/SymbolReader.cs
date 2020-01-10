@@ -1,3 +1,4 @@
+using Microsoft.Diagnostics.Tracing.Utilities;
 using Microsoft.Diagnostics.Utilities;
 using System;
 using System.Collections.Generic;
@@ -10,7 +11,6 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using Utilities;
 
 namespace Microsoft.Diagnostics.Symbols
 {
