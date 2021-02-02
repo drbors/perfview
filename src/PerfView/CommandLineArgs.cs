@@ -96,7 +96,7 @@ namespace PerfView
         public string StopOnException;
         public int StopOnGCOverMsec;
         public int StopOnBGCFinalPauseOverMsec; // Stop on a BGC whose final pause is over this many ms
-        public float DecayToZeroHours;          //causes 'StopOn*OverMSec' timeouts to decay to zero over this time period
+        public double DecayToZeroHours;          //causes 'StopOn*OverMSec' timeouts to decay to zero over this time period
         public int MinSecForTrigger = 3;        // affects StopOnPerfCounter and StartOnPerfCounter
         public string StopOnEventLogMessage;    // stop collection on event logs
         public string StopCommand;              // is executed when a stop is triggered.   
@@ -195,7 +195,7 @@ namespace PerfView
         public int RundownTimeout = 120;
         public int MinRundownTime;
         public bool NoView;
-        public float CpuSampleMSec = 1.0F;
+        public double CpuSampleMSec = 1.0;
         public bool KeepAllEvents;
         public int MaxEventCount;
         public bool ContinueOnError;

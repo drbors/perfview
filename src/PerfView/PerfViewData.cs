@@ -2855,13 +2855,13 @@ table {
                     {
                         var byTimeState = byTimeStats[idx];
                         byTimeState.NumRequests++;
-                        byTimeState.DurationMSecTotal += (float)request.DurationMSec;
-                        byTimeState.QueuedDurationMSecTotal += (float)request.QueueDurationMSec;
-                        if ((float)request.DurationMSec > byTimeState.RequestsMSecMax)
+                        byTimeState.DurationMSecTotal += request.DurationMSec;
+                        byTimeState.QueuedDurationMSecTotal += request.QueueDurationMSec;
+                        if (request.DurationMSec > byTimeState.RequestsMSecMax)
                         {
                             byTimeState.RequestsThreadOfMax = request.HandlerThreadID;
                             byTimeState.RequestsTimeOfMax = request.StartTimeRelativeMSec;
-                            byTimeState.RequestsMSecMax = (float)request.DurationMSec;
+                            byTimeState.RequestsMSecMax = request.DurationMSec;
                         }
                     }
                 }
@@ -3241,26 +3241,26 @@ table {
             public int ContextSwitch;
             public double DiskIOMsec;         // The amount of Disk service time (all disks, machine wide).  
 
-            public float RequestsMSecMax;
+            public double RequestsMSecMax;
             public double RequestsTimeOfMax;
             public int RequestsThreadOfMax;
 
-            public float DurationMSecTotal;
-            public float QueuedDurationMSecTotal;
+            public double DurationMSecTotal;
+            public double QueuedDurationMSecTotal;
 
             public int ThreadPoolThreadCountSum;
             public int ThreadPoolAdjustmentCount;
-            public float MeanThreadPoolThreads { get { return (float)ThreadPoolThreadCountSum / ThreadPoolAdjustmentCount; } }
+            public double MeanThreadPoolThreads { get { return (double)ThreadPoolThreadCountSum / ThreadPoolAdjustmentCount; } }
 
-            public float GCHeapAllocMB;
-            public float GCHeapSizeMB;
-            public float NumGcs;
-            public float NumGen2Gcs;
+            public double GCHeapAllocMB;
+            public double GCHeapSizeMB;
+            public double NumGcs;
+            public double NumGen2Gcs;
             public int Contentions;
             public int MinRequestsQueued;
-            public float MeanRequestsProcessing { get { return MeanRequestsProcessingSum / MeanRequestsProcessingCount; } }
+            public double MeanRequestsProcessing { get { return MeanRequestsProcessingSum / MeanRequestsProcessingCount; } }
 
-            internal float MeanRequestsProcessingSum;
+            internal double MeanRequestsProcessingSum;
             internal int MeanRequestsProcessingCount;
         };
 
@@ -3517,7 +3517,7 @@ table {
                 Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.NeedLoadedDotNetRuntimes(source);
                 Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.AddCallbackOnProcessStart(source, proc =>
                 {
-                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, (float)dataFile.SampleProfileInterval.TotalMilliseconds);
+                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, dataFile.SampleProfileInterval.TotalMilliseconds);
                     proc.Log = dataFile;
                 });
                 source.Process();
@@ -4158,7 +4158,7 @@ table {
             if (!m_WarnedAboutBrokenStacks)
             {
                 m_WarnedAboutBrokenStacks = true;
-                float brokenPercent = Viewer.CallTree.Root.GetBrokenStackCount() * 100 / Viewer.CallTree.Root.InclusiveCount;
+                double brokenPercent = Viewer.CallTree.Root.GetBrokenStackCount() * 100 / Viewer.CallTree.Root.InclusiveCount;
                 if (brokenPercent > 0)
                 {
                     bool is64bit = false;
@@ -4175,7 +4175,7 @@ table {
             }
             return false;
         }
-        private static bool WarnAboutBrokenStacks(Window parentWindow, float brokenPercent, bool is64Bit, TextWriter log)
+        private static bool WarnAboutBrokenStacks(Window parentWindow, double brokenPercent, bool is64Bit, TextWriter log)
         {
             if (brokenPercent > 1)
             {
@@ -4434,7 +4434,7 @@ table {
 
                     newHeap.OnGC += delegate (double time, int gen)
                     {
-                        sample.Metric = float.Epsilon;
+                        sample.Metric = double.Epsilon;
                         sample.Count = 1;
                         sample.TimeRelativeMSec = time;
                         StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
@@ -4472,7 +4472,7 @@ table {
 
                     newHeap.OnGC += delegate (double time, int gen)
                     {
-                        sample.Metric = float.Epsilon;
+                        sample.Metric = double.Epsilon;
                         sample.Count = 1;
                         sample.TimeRelativeMSec = time;
                         StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
@@ -5587,14 +5587,14 @@ table {
 
                         var queueStackIdx = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern("Time in Disk Queue " + diskNumber), stackIdx);
                         sample.StackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(nodeName), queueStackIdx);
-                        sample.Metric = (float)(elapsedMSec - serviceTimeMSec);
+                        sample.Metric = elapsedMSec - serviceTimeMSec;
                         sample.TimeRelativeMSec = data.TimeStampRelativeMSec - elapsedMSec;
                         stackSource.AddSample(sample);
                     }
 
                     stackIdx = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern("Service Time Disk " + diskNumber), stackIdx);
                     sample.StackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(nodeName), stackIdx);
-                    sample.Metric = (float)serviceTimeMSec;
+                    sample.Metric = serviceTimeMSec;
                     sample.TimeRelativeMSec = data.TimeStampRelativeMSec - serviceTimeMSec;
                     stackSource.AddSample(sample);
                 });
@@ -5651,7 +5651,7 @@ table {
             {
                 eventSource.Kernel.AddCallbackForEvents<FileIOReadWriteTraceData>(delegate (FileIOReadWriteTraceData data)
                 {
-                    sample.Metric = (float)data.IoSize;
+                    sample.Metric = data.IoSize;
                     sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
 
                     StackSourceCallStackIndex stackIdx = stackSource.GetCallStack(data.CallStackIndex(), data);
@@ -5927,10 +5927,10 @@ table {
 
                 Address lastHeapHandle = 0;
 
-                float peakMetric = 0;
+                double peakMetric = 0;
                 StackSourceSample peakSample = null;
-                float cumMetric = 0;
-                float sumCumMetric = 0;
+                double cumMetric = 0;
+                double sumCumMetric = 0;
                 int cumCount = 0;
 
                 heapParser.HeapTraceAlloc += delegate (HeapAllocTraceData data)
@@ -6127,7 +6127,7 @@ table {
                 Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.NeedLoadedDotNetRuntimes(eventSource);
                 Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.AddCallbackOnProcessStart(eventSource, proc =>
                 {
-                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, (float)eventLog.SampleProfileInterval.TotalMilliseconds);
+                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, eventLog.SampleProfileInterval.TotalMilliseconds);
                     Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.SetMutableTraceEventStackSource(proc, stackSource);
                 });
                 eventSource.Process();
@@ -6279,7 +6279,7 @@ table {
         private static void LogGCHandleLifetime(MutableTraceEventStackSource stackSource,
             StackSourceSample sample, GCHandleInfo info, double timeRelativeMSec, TextWriter log)
         {
-            sample.Metric = (float)(timeRelativeMSec - info.PinStartTimeRelativeMSec);
+            sample.Metric = timeRelativeMSec - info.PinStartTimeRelativeMSec;
             if (sample.Metric < 0)
             {
                 log.WriteLine("Error got a negative time at {0:n3} started {1:n3}.  Dropping", timeRelativeMSec, info.PinStartTimeRelativeMSec);
@@ -9014,7 +9014,7 @@ table {
 
                                 newHeap.OnGC += delegate (double time, int gen)
                                 {
-                                    sample.Metric = float.Epsilon;
+                                    sample.Metric = double.Epsilon;
                                     sample.Count = 1;
                                     sample.TimeRelativeMSec = time;
                                     StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
@@ -9052,7 +9052,7 @@ table {
 
                                 newHeap.OnGC += delegate (double time, int gen)
                                 {
-                                    sample.Metric = float.Epsilon;
+                                    sample.Metric = double.Epsilon;
                                     sample.Count = 1;
                                     sample.TimeRelativeMSec = time;
                                     StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);

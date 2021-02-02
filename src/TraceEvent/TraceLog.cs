@@ -2246,7 +2246,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
             // Confirm that the CPU stats make sense.  
             foreach (var process in Processes)
             {
-                float cpuFromThreads = 0;
+                double cpuFromThreads = 0;
                 foreach (var curThread in process.Threads)
                 {
                     cpuFromThreads += curThread.CPUMSec;
@@ -5575,7 +5575,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// <summary>
         /// The amount of CPU time spent in this process based on the kernel CPU sampling events.   
         /// </summary>
-        public float CPUMSec { get { return (float)(cpuSamples * Log.SampleProfileInterval.TotalMilliseconds); } }
+        public double CPUMSec { get { return cpuSamples * Log.SampleProfileInterval.TotalMilliseconds; } }
         /// <summary>
         /// Returns true if the process is a 64 bit process
         /// </summary>
@@ -6357,7 +6357,7 @@ namespace Microsoft.Diagnostics.Tracing.Etlx
         /// <summary>
         /// The amount of CPU time spent on this thread based on the kernel CPU sampling events.   
         /// </summary>
-        public float CPUMSec { get { return (float)(cpuSamples * Process.Log.SampleProfileInterval.TotalMilliseconds); } }
+        public double CPUMSec { get { return cpuSamples * Process.Log.SampleProfileInterval.TotalMilliseconds; } }
         /// <summary>
         /// Filters events to only those for a particular thread. 
         /// </summary>

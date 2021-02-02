@@ -30,7 +30,7 @@ namespace Graphs
         /// countMultipliers[T] = 10 then the stack source will return 50.   This is used to scale
         /// sampled graphs.   
         /// </summary>
-        public MemoryGraphStackSource(Graph graph, TextWriter log, float[] countMultipliers = null)
+        public MemoryGraphStackSource(Graph graph, TextWriter log, double[] countMultipliers = null)
         {
             m_asMemoryGraph = graph as MemoryGraph;
             m_graph = graph;
@@ -82,7 +82,7 @@ namespace Graphs
 
 #if false // TODO FIX NOW REMOVE 
         // We support sampling rate.  
-        public override float? SamplingRate
+        public override double? SamplingRate
         {
             get { return m_samplingRate; }
             set
@@ -228,12 +228,12 @@ namespace Graphs
 
             // We keep track of node depth so that we can limit it.   
             int[] nodeDepth = new int[m_parent.Length];
-            float[] nodePriorities = new float[m_parent.Length];
+            double[] nodePriorities = new double[m_parent.Length];
             MemoryGraph asMemoryGraph = m_graph as MemoryGraph;
 
             bool scanedForOrphans = false;
-            var epsilon = 1E-7F;            // Something that is big enough not to bet lost in roundoff error.  
-            float order = 0;
+            var epsilon = 1E-7;            // Something that is big enough not to bet lost in roundoff error.  
+            double order = 0;
             for (int i = 0; ; i++)
             {
                 if ((i & 0x1FFF) == 0)  // Every 8K
@@ -242,7 +242,7 @@ namespace Graphs
                 }
 
                 NodeIndex nodeIndex;
-                float nodePriority;
+                double nodePriority;
                 if (nodesToVisit.Count == 0)
                 {
                     nodePriority = 0;
@@ -577,12 +577,12 @@ namespace Graphs
         {
             if (m_typePriorities == null)
             {
-                m_typePriorities = new float[(int)m_graph.NodeTypeIndexLimit];
+                m_typePriorities = new double[(int)m_graph.NodeTypeIndexLimit];
             }
 
             string[] priorityPatArray = priorityPats.Split(';');
             Regex[] priorityRegExArray = new Regex[priorityPatArray.Length];
-            float[] priorityArray = new float[priorityPatArray.Length];
+            double[] priorityArray = new double[priorityPatArray.Length];
             for (int i = 0; i < priorityPatArray.Length; i++)
             {
                 var m = Regex.Match(priorityPatArray[i], @"(.*)->(-?\d+.?\d*)");
@@ -598,7 +598,7 @@ namespace Graphs
 
                 var dotNetRegEx = FilterStackSource.ToDotNetRegEx(m.Groups[1].Value.Trim());
                 priorityRegExArray[i] = new Regex(dotNetRegEx, RegexOptions.IgnoreCase);
-                priorityArray[i] = float.Parse(m.Groups[2].Value);
+                priorityArray[i] = double.Parse(m.Groups[2].Value);
             }
 
             // Assign every type index a priority in m_typePriorities based on if they match a pattern.  
@@ -682,13 +682,13 @@ namespace Graphs
 
         // We give each type a priority (using the m_priority Regular expressions) which guide the breadth-first scan. 
         private string m_priorityRegExs;
-        private float[] m_typePriorities;
+        private double[] m_typePriorities;
         private NodeType m_typeStorage;
         private Node m_nodeStorage;                 // Only for things that can't be reentrant
         private Node m_childStorage;
         private Node m_cachedNodeStorage;           // Used when it could be reentrant
         private StackSourceSample m_sampleStorage;
-        private float[] m_countMultipliers;
+        private double[] m_countMultipliers;
         private Address m_maxAddress;               // The maximum memory address in the graph (needed by SampleTimeRelativeMSecLimit)     
         private TextWriter m_log;                   // processing messages 
         #endregion
