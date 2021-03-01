@@ -1399,7 +1399,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 }
             }
 
-            serializer.Write(count);
+            serializer.WriteInt32(count);
             foreach (var template in m_templates.Values)
             {
                 if (template != null)
@@ -1407,7 +1407,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 #if DEBUG
                     --count;
 #endif
-                    serializer.Write(template);
+                    serializer.WriteObject(template);
                 }
             }
             Debug.Assert(count == 0);
