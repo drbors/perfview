@@ -2,6 +2,7 @@ using FastSerialization;
 using Microsoft.Diagnostics.Tracing.EventPipe;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Clr;
+using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Session;
 using System;
 using System.Collections.Generic;
@@ -30,6 +31,39 @@ namespace Microsoft.Diagnostics.Tracing
     {
         public EventPipeEventSource(string fileName) : this(new PinnedStreamReader(fileName, 0x20000, new SerializationConfiguration() { StreamLabelWidth = StreamLabelWidth.FourBytes }), fileName, false)
         {
+            // NOTE: Copied from ETWTraceEventSource.cs
+
+            var kernelParser = new KernelTraceEventParser(this, KernelTraceEventParser.ParserTrackingOptions.None);
+
+            kernelParser.ProcessStartGroup += delegate (ProcessTraceData data)
+            {
+                // Get just the file name without the extension.  Can't use the 'Path' class because
+                // it tests to make certain it does not have illegal chars etc.  Since KernelImageFileName
+                // is not a true user mode path, we can get failures.
+                string path = data.KernelImageFileName;
+                int startIdx = path.LastIndexOf('\\');
+                if (0 <= startIdx)
+                {
+                    startIdx++;
+                }
+                else
+                {
+                    startIdx = 0;
+                }
+
+                int endIdx = path.LastIndexOf('.');
+                if (endIdx <= startIdx)
+                {
+                    endIdx = path.Length;
+                }
+
+                _processNameForID[data.ProcessID] = path.Substring(startIdx, endIdx - startIdx);
+            };
+
+            kernelParser.ProcessEndGroup += delegate (ProcessTraceData data)
+            {
+                _processNameForID.Remove(data.ProcessID);
+            };
         }
 
         public EventPipeEventSource(Stream stream)
@@ -187,7 +221,7 @@ namespace Microsoft.Diagnostics.Tracing
         internal EventCache EventCache { get; private set; }
         internal StackCache StackCache { get; private set; }
 
-        internal override string ProcessName(int processID, long timeQPC) => string.Format("Process({0})", processID);
+        internal override string ProcessName(int processID, long timeQPC) => _processNameForID.TryGetValue(processID, out var retVal) ? retVal : $"Process({processID})";
 
         internal void ReadAndDispatchEvent(PinnedStreamReader reader, bool useHeaderCompression)
         {
@@ -204,6 +238,12 @@ namespace Microsoft.Diagnostics.Tracing
                 Debug.Assert(sessionEndTimeQPC == 0 || eventRecord->EventHeader.TimeStamp - sessionEndTimeQPC < _QPCFreq * 24 * 3600);
 
                 var traceEvent = Lookup(eventRecord);
+
+                if (traceEvent.NeedsFixup)
+                {
+                    traceEvent.FixupData();
+                }
+
                 Dispatch(traceEvent);
                 sessionEndTimeQPC = eventRecord->EventHeader.TimeStamp;
             }
@@ -312,6 +352,12 @@ namespace Microsoft.Diagnostics.Tracing
                         Debug.Assert(tagLength == 1);
                         metaDataHeader.Opcode = reader.ReadByte();
                         SetOpcode(eventTemplate, metaDataHeader.Opcode);
+                    }
+                    else if (tag == EventPipeMetadataTag.WindowsClassicEventProviderGuid)
+                    {
+                        Debug.Assert(tagLength == 16);
+                        metaDataHeader.SetClassicProviderGuid(reader.ReadGuid());
+                        SetClassicProviderId(eventTemplate, metaDataHeader.ProviderId);
                     }
 
                     // Skip any remaining bytes or unknown tags
@@ -493,6 +539,12 @@ namespace Microsoft.Diagnostics.Tracing
             template.payloadFetches = classInfo.FieldFetches;
 
             return;
+        }
+
+        private void SetClassicProviderId(DynamicTraceEventData template, in Guid guid)
+        {
+            template.taskGuid = guid;
+            template.lookupAsClassic = true;
         }
 
         private void SetOpcode(DynamicTraceEventData template, int opcode)
@@ -850,6 +902,7 @@ namespace Microsoft.Diagnostics.Tracing
 #if SUPPORT_V1_V2
         private StreamLabel _endOfEventStream;
 #endif
+        private Dictionary<int, string> _processNameForID = new Dictionary<int, string>();
         private Dictionary<int, EventPipeEventMetaDataHeader> _eventMetadataDictionary = new Dictionary<int, EventPipeEventMetaDataHeader>();
         private Deserializer _deserializer;
         private Dictionary<TraceEvent, DynamicTraceEventData> _metadataTemplates =
@@ -1022,7 +1075,8 @@ namespace Microsoft.Diagnostics.Tracing
     internal enum EventPipeMetadataTag
     {
         Opcode = 1,
-        ParameterPayloadV2 = 2
+        ParameterPayloadV2 = 2,
+        WindowsClassicEventProviderGuid = 3
     }
 
     /// <summary>
@@ -1185,6 +1239,13 @@ namespace Microsoft.Diagnostics.Tracing
             }
 
             return _eventRecord;
+        }
+
+        internal void SetClassicProviderGuid(in Guid providerId)
+        {
+            _eventRecord->EventHeader.Flags |= TraceEventNativeMethods.EVENT_HEADER_FLAG_CLASSIC_HEADER;
+            _eventRecord->EventHeader.Id = 0;
+            _eventRecord->EventHeader.ProviderId = providerId;
         }
 
         /// <summary>
