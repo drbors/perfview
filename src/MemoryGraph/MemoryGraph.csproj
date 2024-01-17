@@ -2,7 +2,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net462;netstandard2.0</TargetFrameworks>
+    <TargetFrameworks>netstandard2.0</TargetFrameworks>
     <RootNamespace>Microsoft.Diagnostics.MemoryGraph</RootNamespace>
     <AssemblyName>Microsoft.Diagnostics.MemoryGraph</AssemblyName>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
@@ -10,6 +10,11 @@
     <Company>Microsoft</Company>
     <Description>MemoryGraph library</Description>
     <Copyright>Copyright © Microsoft 2010</Copyright>
+    <Version>$(MemoryGraphVersion)</Version>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <HighEntropyVA>true</HighEntropyVA>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,7 +24,7 @@
 
   <ItemGroup>
     <!-- *** SourceLink Support *** -->
-    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0-beta-63127-02" PrivateAssets="All"/>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="$(MicrosoftSourceLinkGitHubVersion)" PrivateAssets="All"/>
   </ItemGroup>
 
   <!-- ******************* Signing Support *********************** -->
@@ -28,7 +33,7 @@
         <Authenticode>Microsoft400</Authenticode>
         <StrongName>StrongName</StrongName>
     </FilesToSign>
-    <PackageReference Include="MicroBuild.Core" Version="0.2.0" />
+    <PackageReference Include="MicroBuild.Core" Version="$(MicroBuildCoreVersion)" />
   </ItemGroup>
 
   <!-- .NET Strong Name Signing -->

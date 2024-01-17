@@ -3,6 +3,7 @@ using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
+using Microsoft.Diagnostics.Utilities;
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -22,7 +23,7 @@ namespace PerfView
         public ETWEventSource(TraceLog traceLog)
         {
             m_tracelog = traceLog;
-            NonRestFields = 4;
+            NonRestFields = 10;
             MaxEventTimeRelativeMsec = traceLog.SessionDuration.TotalMilliseconds;
         }
         public override ICollection<string> EventNames
@@ -327,6 +328,15 @@ namespace PerfView
                         }
                     }
 
+                    if (FilterQueryExpressionTree != null)
+                    {
+                        var match = FilterQueryExpressionTree.Match(data);
+                        if (!match)
+                        {
+                            return;
+                        }
+                    }
+
                     cnt++;
                     if (MaxRet < cnt)
                     {
@@ -485,7 +495,7 @@ namespace PerfView
             columnsForSelectedEvents["ActivityID"] = "ActivityID";
             columnsForSelectedEvents["RelatedActivityID"] = "RelatedActivityID";
             columnsForSelectedEvents["HasStack"] = "HasStack";
-            columnsForSelectedEvents["HasBlockedStack"] = "HasBlockedStack";
+            columnsForSelectedEvents["HasBlockingStack"] = "HasBlockingStack";
             columnsForSelectedEvents["DURATION_MSEC"] = "DURATION_MSEC";
             columnsForSelectedEvents["FormattedMessage"] = "FormattedMessage";
             columnsForSelectedEvents["ContainerID"] = "ContainerID";
@@ -813,7 +823,7 @@ namespace PerfView
             m_records = records;
             m_records.OnNewRecord += this.EventCallback;
 
-            NonRestFields = 4;
+            NonRestFields = 10;
             MaxEventTimeRelativeMsec = 60000;       // Currently set to 1 min, will expand when we exceed that.  
             m_allEventRecords = new List<GenericEventRecord>();
             m_eventFieldNames = new SortedDictionary<string, string[]>();

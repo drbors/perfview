@@ -2,15 +2,24 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net462</TargetFramework>
+    <TargetFrameworks>net462;net6.0</TargetFrameworks>
 
     <Description>CSVReader</Description>
     <Company>Microsoft</Company>
     <Copyright>Copyright © Microsoft 2010</Copyright>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <HighEntropyVA>true</HighEntropyVA>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\TraceEvent\TraceEvent.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Security.Permissions" Version="7.0.0" />
   </ItemGroup>
 
   <!-- ******************* Signing Support *********************** -->
@@ -19,7 +28,7 @@
         <Authenticode>Microsoft400</Authenticode>
         <StrongName>StrongName</StrongName>
     </FilesToSign>
-    <PackageReference Include="MicroBuild.Core" Version="0.2.0" />
+    <PackageReference Include="MicroBuild.Core" Version="$(MicroBuildCoreVersion)" />
   </ItemGroup>
 
   <!-- .NET Strong Name Signing -->

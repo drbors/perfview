@@ -331,7 +331,7 @@ namespace PerfView
                 RundownTimeoutTextBox.IsEnabled = !args.NoRundown;
                 if (args.CircularMB == 0)
                 {
-                    CircularTextBox.Text = "500";
+                    CircularTextBox.Text = "4000";
                 }
 
                 OKButton.Content = "Start Collection";
@@ -587,6 +587,10 @@ namespace PerfView
                     }
                     m_args.FocusProcess = FocusProcessTextBox.Text;
                 }
+                else
+                {
+                    m_args.FocusProcess = null;
+                }
             }
 
             m_args.DataFile = DataFileNameTextBox.Text;
@@ -597,7 +601,7 @@ namespace PerfView
                 return false;
             }
 
-            if (!float.TryParse(SampleIntervalTextBox.Text, out m_args.CpuSampleMSec))
+            if (!double.TryParse(SampleIntervalTextBox.Text, out m_args.CpuSampleMSec))
             {
                 m_mainWindow.StatusBar.LogError("Could not parse sample interval timeout value: " + SampleIntervalTextBox.Text);
                 return false;
@@ -657,6 +661,10 @@ namespace PerfView
             if (KernelBaseCheckBox.IsChecked ?? false)
             {
                 m_args.KernelEvents = (KernelTraceEventParser.Keywords)(KernelTraceEventParser.Keywords.Default - KernelTraceEventParser.Keywords.Profile);
+            }
+            else
+            {
+                m_args.KernelEvents = KernelTraceEventParser.Keywords.None;
             }
 
             if (CpuSamplesCheckBox.IsChecked ?? false)

@@ -117,7 +117,7 @@ namespace PerfView
             // By default, it is group module entries.
             if (defaultGroupPat == null)
             {
-                defaultGroupPat = @"[group module entries]  {%}!=>module $1";
+                defaultGroupPat = @"[no grouping]";
             }
 
             return defaultGroupPat;
@@ -261,8 +261,8 @@ namespace PerfView
                 }
                 else
                 {
-                    var sampleRate = 1.0F;
-                    float.TryParse(SamplingTextBox.Text, out sampleRate);
+                    var sampleRate = 1.0;
+                    double.TryParse(SamplingTextBox.Text, out sampleRate);
                     if (sampleRate < 1)
                     {
                         sampleRate = 1;
@@ -332,7 +332,7 @@ namespace PerfView
                     histogramEnd += .0006;
                 }
 
-                if (histogramEnd > histogramStart)
+                if (histogramEnd > histogramStart && asMemoryGraphSource == null)
                 {
                     newCallTree.TimeHistogramController = new TimeHistogramController(newCallTree, histogramStart, histogramEnd);
                 }
@@ -372,8 +372,8 @@ namespace PerfView
 
                 // TODO: do we want to expose useWholeTraceMetric = false too?
                 // Fold away all small nodes.                     
-                float minIncusiveTimePercent;
-                if (float.TryParse(filterParams.MinInclusiveTimePercent, out minIncusiveTimePercent) && minIncusiveTimePercent > 0)
+                double minIncusiveTimePercent;
+                if (double.TryParse(filterParams.MinInclusiveTimePercent, out minIncusiveTimePercent) && minIncusiveTimePercent > 0)
                 {
                     newCallTree.FoldNodesUnder(minIncusiveTimePercent * newCallTree.Root.InclusiveMetric / 100, true);
                 }
@@ -422,7 +422,7 @@ namespace PerfView
                         stats = string.Format("{0}  First: {1:n3} Last: {2:n3}  Last-First: {3:n3}  Metric/Interval: {4:n2}  TimeBucket: {5:n1}", stats,
                         CallTree.Root.FirstTimeRelativeMSec, CallTree.Root.LastTimeRelativeMSec, CallTree.Root.DurationMSec,
                         CallTree.Root.InclusiveMetric / CallTree.Root.DurationMSec,
-                        CallTree.TimeHistogramController.BucketDuration);
+                        CallTree.TimeHistogramController?.BucketDuration);
                     }
 
                     if (ExtraTopStats != null)
@@ -430,13 +430,13 @@ namespace PerfView
                         stats = stats + " " + ExtraTopStats;
                     }
 
-                    if (ComputeMaxInTopStats)
+                    if (ComputeMaxInTopStats && CallTree.Root.InclusiveMetricByTime != null)
                     {
                         Histogram histogram = CallTree.Root.InclusiveMetricByTime;
                         TimeHistogramController controller = histogram.Controller as TimeHistogramController;
 
-                        float cum = 0;
-                        float cumMax = float.MinValue;
+                        double cum = 0;
+                        double cumMax = double.MinValue;
                         int cumMaxIdx = -1;
                         for (int i = 0; i < histogram.Count; i++)
                         {
@@ -1601,7 +1601,7 @@ namespace PerfView
                             if (string.Compare(str, pat, StringComparison.OrdinalIgnoreCase) == 0)
                             {
                                 found = true;
-                                var newPriority = float.Parse(num) + delta;
+                                var newPriority = double.Parse(num) + delta;
                                 updatedPriorityPat = str + "->" + newPriority.ToString();
                             }
                         }
@@ -2118,11 +2118,11 @@ namespace PerfView
         private static void PrimeWarmSymbols(StackSource stackSource, int processID, ETLPerfViewData etlFile, TextWriter log)
         {
             // Compute inclusive metric for every module into moduleMetrics
-            var moduleMetrics = new GrowableArray<float>(50);
+            var moduleMetrics = new GrowableArray<double>(50);
             moduleMetrics.Add(0);                                // Index 0 is illegal.  
             var modIdxes = new Dictionary<string, int>(50);      // maps a module name to its count index
             var frameIdxToCountIdx = new int[stackSource.CallFrameIndexLimit];
-            var totalMetric = 0.0F;
+            var totalMetric = 0.0;
             var modulesSeenOnStack = new Dictionary<int, int>(16);
 
             stackSource.ForEach(delegate (StackSourceSample sample)
@@ -2296,8 +2296,9 @@ namespace PerfView
                     throw;
                 }
 
-                SortedDictionary<int, float> metricOnLine;
-                var sourceLocation = GetSourceLocation(asCallTreeNodeBase, cellText, out metricOnLine);
+                SortedDictionary<int, double> metricOnLine;
+                SortedDictionary<int, double> exclusiveMetricOnLine;
+                var sourceLocation = GetSourceLocation(asCallTreeNodeBase, cellText, out metricOnLine, out exclusiveMetricOnLine);
 
                 string sourcePathToOpen = null;
                 string logicalSourcePath = null;
@@ -2321,7 +2322,7 @@ namespace PerfView
                         {
                             sourcePathToOpen = CacheFiles.FindFile(sourcePathToOpen, Path.GetExtension(sourcePathToOpen));
                             StatusBar.Log("Annotating source with metric to the file " + sourcePathToOpen);
-                            AnnotateLines(logicalSourcePath, sourcePathToOpen, metricOnLine);
+                            AnnotateLines(logicalSourcePath, sourcePathToOpen, ("Inc", metricOnLine) ,("Exc", exclusiveMetricOnLine));
                         }
                     }
                 }
@@ -2360,9 +2361,10 @@ namespace PerfView
 
         // TODO FIX NOW review 
         private SourceLocation GetSourceLocation(CallTreeNodeBase asCallTreeNodeBase, string cellText,
-            out SortedDictionary<int, float> metricOnLine)
+            out SortedDictionary<int, double> metricOnLine, out SortedDictionary<int, double> exclusiveMetricOnLine)
         {
             metricOnLine = null;
+            exclusiveMetricOnLine = null;
             var m = Regex.Match(cellText, "<<(.*!.*)>>");
             if (m.Success)
             {
@@ -2371,13 +2373,15 @@ namespace PerfView
 
             // Find the most numerous call stack
             // TODO this can be reasonably expensive.   If it is a problem do something about it (e.g. sampling)
-            var frameIndexCounts = new Dictionary<StackSourceFrameIndex, float>();
+            var frameIndexCounts = new Dictionary<StackSourceFrameIndex, double>();
+            var exclusiveFrameIndexCounts = new Dictionary<StackSourceFrameIndex, double>();
             asCallTreeNodeBase.GetSamples(false, delegate (StackSourceSampleIndex sampleIdx)
             {
                 // Find the callStackIdx which corresponds to the name in the cell, and log it to callStackIndexCounts
                 var matchingFrameIndex = StackSourceFrameIndex.Invalid;
                 var sample = m_stackSource.GetSampleByIndex(sampleIdx);
                 var callStackIdx = sample.StackIndex;
+                bool exclusiveSample = true;
                 while (callStackIdx != StackSourceCallStackIndex.Invalid)
                 {
                     var frameIndex = m_stackSource.GetFrameIndex(callStackIdx);
@@ -2387,11 +2391,18 @@ namespace PerfView
                         matchingFrameIndex = frameIndex;        // We keep overwriting it, so we get the entry closest to the root.  
                     }
 
+                    if (exclusiveSample)
+                    {
+                        exclusiveSample = false;
+                        double count = 0;
+                        exclusiveFrameIndexCounts.TryGetValue(matchingFrameIndex, out count);
+                        exclusiveFrameIndexCounts[matchingFrameIndex] = count + sample.Metric;
+                    }
                     callStackIdx = m_stackSource.GetCallerIndex(callStackIdx);
                 }
                 if (matchingFrameIndex != StackSourceFrameIndex.Invalid)
                 {
-                    float count = 0;
+                    double count = 0;
                     frameIndexCounts.TryGetValue(matchingFrameIndex, out count);
                     frameIndexCounts[matchingFrameIndex] = count + sample.Metric;
                 }
@@ -2402,7 +2413,7 @@ namespace PerfView
             // If other samples are in that file we also display them but it is this maximum
             // that drives which file we open and where we put the editor's focus.  
             StackSourceFrameIndex maxFrameIdx = StackSourceFrameIndex.Invalid;
-            float maxFrameIdxCount = -1;
+            double maxFrameIdxCount = -1;
             foreach (var keyValue in frameIndexCounts)
             {
                 if (keyValue.Value >= maxFrameIdxCount)
@@ -2437,18 +2448,25 @@ namespace PerfView
             if (sourceLocation != null)
             {
                 var filePathForMax = sourceLocation.SourceFile.BuildTimeFilePath;
-                metricOnLine = new SortedDictionary<int, float>();
                 // Accumulate the counts on a line basis
-                foreach (StackSourceFrameIndex frameIdx in frameIndexCounts.Keys)
+                AccumulateCounts(frameIndexCounts, out metricOnLine);
+                AccumulateCounts(exclusiveFrameIndexCounts, out exclusiveMetricOnLine);
+
+                void AccumulateCounts(Dictionary<StackSourceFrameIndex, double> indexCounts, out SortedDictionary<int, double> metricHash)
                 {
-                    var loc = asTraceEventStackSource.GetSourceLine(frameIdx, reader);
-                    if (loc != null && loc.SourceFile.BuildTimeFilePath == filePathForMax)
+                    metricHash = new SortedDictionary<int, double>();
+
+                    foreach (StackSourceFrameIndex frameIdx in indexCounts.Keys)
                     {
-                        frameToLine[frameIdx] = loc.LineNumber;
-                        float metric;
-                        metricOnLine.TryGetValue(loc.LineNumber, out metric);
-                        metric += frameIndexCounts[frameIdx];
-                        metricOnLine[loc.LineNumber] = metric;
+                        var loc = asTraceEventStackSource.GetSourceLine(frameIdx, reader);
+                        if (loc != null && loc.SourceFile.BuildTimeFilePath == filePathForMax)
+                        {
+                            frameToLine[frameIdx] = loc.LineNumber;
+                            double metric;
+                            metricHash.TryGetValue(loc.LineNumber, out metric);
+                            metric += indexCounts[frameIdx];
+                            metricHash[loc.LineNumber] = metric;
+                        }
                     }
                 }
             }
@@ -2458,7 +2476,7 @@ namespace PerfView
             bool commonMethodIdxSet = false;
             MethodIndex commonMethodIdx = MethodIndex.Invalid;
 
-            var nativeAddressFreq = new SortedDictionary<Address, Tuple<int, float>>();
+            var nativeAddressFreq = new SortedDictionary<Address, Tuple<int, double>>();
             foreach (var keyValue in frameIndexCounts)
             {
                 var codeAddr = asTraceEventStackSource.GetFrameCodeAddress(keyValue.Key);
@@ -2482,7 +2500,7 @@ namespace PerfView
                     var nativeAddr = asTraceEventStackSource.TraceLog.CodeAddresses.Address(codeAddr);
                     var lineNum = 0;
                     frameToLine.TryGetValue(keyValue.Key, out lineNum);
-                    nativeAddressFreq[nativeAddr] = new Tuple<int, float>(lineNum, keyValue.Value);
+                    nativeAddressFreq[nativeAddr] = new Tuple<int, double>(lineNum, keyValue.Value);
                 }
             }
             StatusBar.LogWriter.WriteLine();
@@ -2509,7 +2527,7 @@ namespace PerfView
             return sourceLocation;
         }
 
-        private void AnnotateLines(string inFileName, string outFileName, SortedDictionary<int, float> lineData)
+        private void AnnotateLines(string inFileName, string outFileName, params ValueTuple<string, SortedDictionary<int, double>>[] lineData)
         {
             using (var inFile = File.OpenText(inFileName))
             using (var outFile = File.CreateText(outFileName))
@@ -2525,18 +2543,21 @@ namespace PerfView
 
                     lineNum++;
 
-                    float value;
-                    if (lineData.TryGetValue(lineNum, out value))
+                    foreach (var data in lineData)
                     {
-                        outFile.Write(ToCompactString(value));
-                    }
-                    else if (lineNum == 1)
-                    {
-                        outFile.Write("Metric|");
-                    }
-                    else
-                    {
-                        outFile.Write("       ");
+                        double value;
+                        if (data.Item2.TryGetValue(lineNum, out value))
+                        {
+                            outFile.Write(ToCompactString(value));
+                        }
+                        else if (lineNum == 1)
+                        {
+                            outFile.Write($"{data.Item1.PadLeft(6)}|");
+                        }
+                        else
+                        {
+                            outFile.Write("       ");
+                        }
                     }
 
                     outFile.WriteLine(line);
@@ -2547,7 +2568,7 @@ namespace PerfView
         /// <summary>
         /// Creat a string that fits in 4 chars + a trailing space. 
         /// </summary>
-        private string ToCompactString(float value)
+        private string ToCompactString(double value)
         {
             var suffix = " |";
             for (int i = 0; ; i++)
@@ -2731,8 +2752,8 @@ namespace PerfView
         }
         private void DoIncreaseFoldPercent(object sender, ExecutedRoutedEventArgs e)
         {
-            float newVal;
-            if (float.TryParse(FoldPercentTextBox.Text, out newVal))
+            double newVal;
+            if (double.TryParse(FoldPercentTextBox.Text, out newVal))
             {
                 FoldPercentTextBox.Text = (newVal * 1.6).ToString("f2");
             }
@@ -2741,8 +2762,8 @@ namespace PerfView
         }
         private void DoDecreaseFoldPercent(object sender, ExecutedRoutedEventArgs e)
         {
-            float newVal;
-            if (float.TryParse(FoldPercentTextBox.Text, out newVal))
+            double newVal;
+            if (double.TryParse(FoldPercentTextBox.Text, out newVal))
             {
                 FoldPercentTextBox.Text = (newVal / 1.6).ToString("f2");
             }
@@ -3293,27 +3314,6 @@ namespace PerfView
 
             // Customize the control
             ByNameDataGrid.Grid.CanUserSortColumns = true;
-            var columns = ByNameDataGrid.Grid.Columns;
-
-
-            // Put the exlusive columns first if they are not already there.  
-            var col = ByNameDataGrid.GetColumnIndex("ExcPercentColumn");
-            if (0 <= col && col != 1)
-            {
-                ByNameDataGrid.Grid.Columns.Move(col, 1);
-            }
-
-            col = ByNameDataGrid.GetColumnIndex("ExcColumn");
-            if (0 <= col && col != 2)
-            {
-                ByNameDataGrid.Grid.Columns.Move(col, 2);
-            }
-
-            col = ByNameDataGrid.GetColumnIndex("ExcCountColumn");
-            if (0 <= col && col != 3)
-            {
-                ByNameDataGrid.Grid.Columns.Move(col, 3);
-            }
 
             // Initialize the CallTree, Callers, and Callees tabs
             // TODO:  Gross that the caller has to pass this in.  

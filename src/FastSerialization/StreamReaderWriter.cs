@@ -8,6 +8,9 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;      // For StringBuilder.
+using System.IO.MemoryMappedFiles;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace FastSerialization
 {
@@ -406,6 +409,33 @@ namespace FastSerialization
                 }
             }
         }
+        public void Write(byte[] data, int offset, int length)
+        {
+            if (data == null)
+            {
+                throw new ArgumentNullException(nameof(data));
+            }
+
+            if (offset < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(offset));
+            }
+
+            if (length < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(length));
+            }
+
+            if (length > data.Length - offset)
+            {
+                throw new ArgumentNullException(nameof(length));
+            }
+
+            for (int i = 0; i < length; i++)
+            {
+                Write(data[offset + i]);
+            }
+        }
         /// <summary>
         /// Implementation of IStreamWriter
         /// </summary>
@@ -421,6 +451,14 @@ namespace FastSerialization
             // This is guaranteed to be uncompressed, but since we are not compressing anything, we can
             // simply write the value.  
             Write(value);
+        }
+
+        /// <summary>
+        /// Finalizer.
+        /// </summary>
+        ~MemoryStreamWriter()
+        {
+            Dispose(false);
         }
 
         /// <summary>
@@ -984,86 +1022,6 @@ namespace FastSerialization
         #endregion
     }
 
-#if PINNEDSTREAMREADER_TESTS
-    public static class PinnedStreamTests
-    {
-        public static void Tests()
-        {
-            string testOrig = "text.orig";
-
-            Random r = new Random(23);
-
-            for (int j = 0; j < 10; j++)
-            {
-                for (int fileSize = 1023; fileSize <= 1025; fileSize++)
-                {
-                    CreateDataFile(testOrig, fileSize);
-                    byte[] origData = File.ReadAllBytes(testOrig);
-
-                    for (int bufferSize = 16; bufferSize < 300; bufferSize += 24)
-                    {
-                        FileStream testData = File.OpenRead(testOrig);
-                        PinnedStreamReader reader = new PinnedStreamReader(testData, bufferSize);
-
-                        // Try reading back in various seek positions. 
-                        for (int i = 0; i < 100; i++)
-                        {
-                            int position = r.Next(0, origData.Length);
-                            int size = r.Next(0, bufferSize) + 1;
-
-                            reader.Goto((StreamLabel)(uint)position);
-                            Compare(reader, origData, position, size);
-                        }
-                        reader.Close();
-                    }
-                }
-                Console.WriteLine("Finished Round " + j);
-            }
-        }
-
-        static int compareCount = 0;
-
-        private static void Compare(PinnedStreamReader reader, byte[] buffer, int offset, int chunkSize)
-        {
-            compareCount++;
-            if (compareCount == -1)
-                Debugger.Break();
-
-            for (int pos = offset; pos < buffer.Length; pos += chunkSize)
-            {
-                if (pos + chunkSize > buffer.Length)
-                    chunkSize = buffer.Length - pos;
-                CompareBuffer(reader.GetPointer(chunkSize), buffer, pos, chunkSize);
-                reader.Skip(chunkSize);
-            }
-        }
-
-        private unsafe static bool CompareBuffer(IntPtr ptr, byte[] buffer, int offset, int size)
-        {
-            byte* bytePtr = (byte*)ptr;
-
-            for (int i = 0; i < size; i++)
-            {
-                if (buffer[i + offset] != bytePtr[i])
-                {
-                    Debug.Assert(false);
-                    return false;
-                }
-            }
-            return true;
-        }
-        private static void CreateDataFile(string name, int length)
-        {
-            FileStream stream = File.Open(name, FileMode.Create);
-            byte val = 0;
-            for (int i = 0; i < length; i++)
-                stream.WriteByte(val++);
-            stream.Close();
-        }
-
-    }
-#endif
-
     /// <summary>
     /// A IOStreamStreamWriter hooks a MemoryStreamWriter up to an output System.IO.Stream
     /// </summary>
@@ -1076,7 +1034,7 @@ namespace FastSerialization
         /// Create a IOStreamStreamWriter that writes its data to a given file that it creates
         /// </summary>
         /// <param name="fileName"></param>
-        public IOStreamStreamWriter(string fileName, SerializationConfiguration config = null) : this(new FileStream(fileName, FileMode.Create), config: config) { }
+        public IOStreamStreamWriter(string fileName, SerializationConfiguration config = null, FileShare share = FileShare.Read) : this(new FileStream(fileName, FileMode.Create, FileAccess.ReadWrite, share), config: config) { }
 
         /// <summary>
         /// Create a IOStreamStreamWriter that writes its data to a System.IO.Stream

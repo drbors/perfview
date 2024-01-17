@@ -1,17 +1,16 @@
-using Microsoft.Diagnostics.Utilities;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Net;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using Utilities;
+using Microsoft.Diagnostics.Utilities;
 
 namespace Microsoft.Diagnostics.Symbols
 {
@@ -23,15 +22,15 @@ namespace Microsoft.Diagnostics.Symbols
     {
         /// <summary>
         /// Opens a new SymbolReader.   All diagnostics messages about symbol lookup go to 'log'.  
+        /// Optional HttpClient delegating handler to be used when downloading symbols or source files.
+        /// Note: The delegating handler will be disposed when this SymbolReader is disposed.
         /// </summary>
-        public SymbolReader(TextWriter log, string nt_symbol_path = null)
+        public SymbolReader(TextWriter log, string nt_symbol_path = null, DelegatingHandler httpClientDelegatingHandler = null)
         {
             m_log = log;
-#if SYNC_SYMBOLREADER_LOG
             // Make sure that accesses to the log are synchronized to avoid races due to the fact that System.Diagnostics.Process
             // uses AsyncStreamReader to read from the stdout/stderr and so it's possible to have concurrent writes to this log.
             m_log = TextWriter.Synchronized(log);
-#endif
             m_symbolModuleCache = new Cache<string, ManagedSymbolModule>(10);
             m_pdbPathCache = new Cache<PdbSignature, string>(10);
 
@@ -67,6 +66,19 @@ namespace Microsoft.Diagnostics.Symbols
             }
             var newSymPathStr = newSymPath.ToString();
             m_symbolPath = newSymPathStr;
+
+            if (httpClientDelegatingHandler != null)
+            {
+                HttpClient = new HttpClient(httpClientDelegatingHandler, disposeHandler: true);
+            }
+            else
+            {
+                HttpClient = new HttpClient();
+            }
+
+            // Some symbol servers want a user agent and simply fail if they don't have one (see https://github.com/Microsoft/perfview/issues/571)
+            // So set it (this is what the symsrv code on Windows sets).
+            HttpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Microsoft-Symbol-Server/6.13.0009.1140");
         }
 
         // These routines find a PDB based on something (either an DLL or a PDB 'signature')
@@ -113,7 +125,7 @@ namespace Microsoft.Diagnostics.Symbols
                                 else
                                 {
                                     m_log.WriteLine("FindSymbolFilePathForModule: Could not find PDB for NGEN image, Trying to generate it.");
-                                    ret = GenerateNGenSymbolsForModule(Path.GetFullPath(dllFilePath));
+                                    ret = GenerateNGenSymbolsForModule(Path.GetFullPath(dllFilePath), m_log, SymbolPath, SymbolCacheDirectory);
                                 }
                             }
                             m_log.WriteLine("FindSymbolFilePathForModule returns {0} for {1} {2} {3} {4}", ret ?? "NULL", pdbName, pdbGuid, pdbAge, fileVersionString ?? "NULL");
@@ -170,13 +182,13 @@ namespace Microsoft.Diagnostics.Symbols
             }
 
             string pdbIndexPath = null;
-            string pdbSimpleName = Path.GetFileName(pdbFileName);        // Make sure the simple name is really a simple name
+            string pdbSimpleName = PathUtil.GetPlatformIndependentFileName(pdbFileName);        // Make sure the simple name is really a simple name
 
             // If we have a dllPath, look right beside it, or in a directory symbols.pri\retail\dll
             if (pdbPath == null && dllFilePath != null)        // Check next to the file. 
             {
                 m_log.WriteLine("FindSymbolFilePath: Checking relative to DLL path {0}", dllFilePath);
-                string pdbPathCandidate = Path.Combine(Path.GetDirectoryName(dllFilePath), Path.GetFileName(pdbFileName));
+                string pdbPathCandidate = Path.Combine(Path.GetDirectoryName(dllFilePath), PathUtil.GetPlatformIndependentFileName(pdbFileName));
                 if (PdbMatches(pdbPathCandidate, pdbIndexGuid, pdbIndexAge))
                 {
                     pdbPath = pdbPathCandidate;
@@ -227,7 +239,7 @@ namespace Microsoft.Diagnostics.Symbols
                         if (pdbIndexPath == null)
                         {
                             // symbolsource.org and nuget.smbsrc.net only support upper case of pdbIndexGuid
-                            pdbIndexPath = pdbSimpleName + @"\" + pdbIndexGuid.ToString("N").ToUpper() + pdbIndexAge.ToString() + @"\" + pdbSimpleName;
+                            pdbIndexPath = pdbSimpleName + @"\" + pdbIndexGuid.ToString("N").ToUpper() + pdbIndexAge.ToString("x") + @"\" + pdbSimpleName;
                         }
 
                         string cache = element.Cache;
@@ -357,25 +369,43 @@ namespace Microsoft.Diagnostics.Symbols
         {
             if (!m_symbolModuleCache.TryGet(pdbFilePath, out ManagedSymbolModule ret))
             {
-                Stream stream = File.Open(pdbFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                byte[] firstBytes = new byte[4];
-                if (stream.Read(firstBytes, 0, firstBytes.Length) != 4)
+                FileStream stream = File.Open(pdbFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                try
                 {
-                    throw new InvalidOperationException("PDB corrupted (too small) " + pdbFilePath);
+                    byte[] firstBytes = new byte[4];
+                    if (stream.Read(firstBytes, 0, firstBytes.Length) != 4)
+                    {
+                        throw new InvalidOperationException("PDB corrupted (too small) " + pdbFilePath);
+                    }
+
+                    if (firstBytes[0] == 'B' && firstBytes[1] == 'S' && firstBytes[2] == 'J' && firstBytes[3] == 'B')
+                    {
+                        stream.Seek(0, SeekOrigin.Begin);   // Start over
+                        ret = new PortableSymbolModule(this, stream, pdbFilePath);
+                    }
+                    else
+                    {
+                        stream.Dispose();
+                        stream = null;
+                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        {
+                            ret = new NativeSymbolModule(this, pdbFilePath);
+                        }
+                        else
+                        {
+                            ret = null;
+                        }
+                    }
+                }
+                catch
+                {
+                    stream?.Dispose();
+                    throw;
                 }
 
-                if (firstBytes[0] == 'B' && firstBytes[1] == 'S' && firstBytes[2] == 'J' && firstBytes[3] == 'B')
-                {
-                    stream.Seek(0, SeekOrigin.Begin);   // Start over
-                    ret = new PortableSymbolModule(this, stream, pdbFilePath);
-                }
-                else
-                {
-                    stream.Dispose();
-                    ret = new NativeSymbolModule(this, pdbFilePath);
-                }
                 m_symbolModuleCache.Add(pdbFilePath, ret);
             }
+
             return ret;
         }
 
@@ -443,10 +473,7 @@ namespace Microsoft.Diagnostics.Symbols
                 return m_SymbolCacheDirectory;
             }
         }
-        /// <summary>
-        /// Authorization header to be ued when making requests to source server (only for SourceLink)
-        /// </summary>
-        public string AuthorizationHeaderForSourceLink { get; set; }
+
         /// <summary>
         /// The place where source is downloaded from a source server.  
         /// </summary>
@@ -476,7 +503,7 @@ namespace Microsoft.Diagnostics.Symbols
             {
                 _Options = value;
                 m_pdbPathCache.Clear();
-                m_log.WriteLine("Setting SYmbolReaderOptions forces clearing Pdb lookup cache");
+                m_log.WriteLine("Setting SymbolReaderOptions forces clearing Pdb lookup cache");
             }
         }
         private SymbolReaderOptions _Options;
@@ -498,6 +525,8 @@ namespace Microsoft.Diagnostics.Symbols
         /// </summary>
         public TextWriter Log { get { return m_log; } }
 
+        internal HttpClient HttpClient { get; private set; }
+
         /// <summary>
         /// Given a full filename path to an NGEN image, ensure that there is an NGEN image for it
         /// in the symbol cache.  If one already exists, this method simply returns that.   If not
@@ -514,16 +543,11 @@ namespace Microsoft.Diagnostics.Symbols
         /// 
         /// <returns>The full path name of the PDB generated for the NGEN image.</returns>
         /// </summary>
-        public string GenerateNGenSymbolsForModule(string ngenImageFullPath, string outputDirectory = null)
+        public static string GenerateNGenSymbolsForModule(string ngenImageFullPath, TextWriter log, string symbolPath, string outputDirectory)
         {
-            if (outputDirectory == null)
-            {
-                outputDirectory = SymbolCacheDirectory;
-            }
-
             if (!File.Exists(ngenImageFullPath))
             {
-                m_log.WriteLine("Warning, NGEN image does not exist: {0}", ngenImageFullPath);
+                log.WriteLine("Warning, NGEN image does not exist: {0}", ngenImageFullPath);
                 return null;
             }
 
@@ -534,7 +558,7 @@ namespace Microsoft.Diagnostics.Symbols
             {
                 if (!peFile.GetPdbSignature(out pdbFileName, out pdbGuid, out pdbAge, true))
                 {
-                    m_log.WriteLine("Could not get PDB signature for {0}", ngenImageFullPath);
+                    log.WriteLine("Could not get PDB signature for {0}", ngenImageFullPath);
                     return null;
                 }
             }
@@ -552,22 +576,22 @@ namespace Microsoft.Diagnostics.Symbols
             // We only handle cases where we generate NGEN pdbs.  
             if (!pdbPath.EndsWith(".ni.pdb", StringComparison.OrdinalIgnoreCase))
             {
-                m_log.WriteLine("Pdb does not have .ni.pdb suffix");
+                log.WriteLine("Pdb does not have .ni.pdb suffix");
                 return null;
             }
 
             string privateRuntimeVerString;
-            var clrDir = GetClrDirectoryForNGenImage(ngenImageFullPath, m_log, out privateRuntimeVerString);
+            var clrDir = GetClrDirectoryForNGenImage(ngenImageFullPath, log, out privateRuntimeVerString);
             if (clrDir == null)
             {
-                m_log.WriteLine("Could not find CLR directory for NGEN image {0}, Trying .NET Core", ngenImageFullPath);
-                return HandleNetCorePdbs(ngenImageFullPath, pdbPath);
+                log.WriteLine("Could not find CLR directory for NGEN image {0}, Trying .NET Core", ngenImageFullPath);
+                return HandleNetCorePdbs(ngenImageFullPath, pdbPath, log);
             }
 
             // See if this is a V4.5 CLR, if so we can do line numbers too.l  
             var lineNumberArg = "";
             var ngenexe = Path.Combine(clrDir, "ngen.exe");
-            m_log.WriteLine("Checking for V4.5 for NGEN image {0}", ngenexe);
+            log.WriteLine("Checking for V4.5 for NGEN image {0}", ngenexe);
             if (!File.Exists(ngenexe))
             {
                 return null;
@@ -582,7 +606,7 @@ namespace Microsoft.Diagnostics.Symbols
                 if (fileVersionInfo != null)
                 {
                     var clrFileVersion = fileVersionInfo.FileVersion;
-                    m_log.WriteLine("Got NGEN image file version number: {0}", clrFileVersion);
+                    log.WriteLine("Got NGEN image file version number: {0}", clrFileVersion);
 
                     m = Regex.Match(clrFileVersion, @"(\d+).(\d+)((\d|\.)*)");
                     if (m.Success)
@@ -592,7 +616,7 @@ namespace Microsoft.Diagnostics.Symbols
                         var majorMinor = majorVersion * 10 + minorVersion;
                         if (majorMinor >= 46)
                         {
-                            m_log.WriteLine("Is a V4.6 or beyond");
+                            log.WriteLine("Is a V4.6 or beyond");
                             isV4_5Runtime = true;
                         }
                         else if (majorMinor == 40)
@@ -609,8 +633,8 @@ namespace Microsoft.Diagnostics.Symbols
             }
 
             var options = new CommandOptions();
-            options.AddEnvironmentVariable("_NT_SYMBOL_PATH", SymbolPath);
-            options.AddOutputStream(m_log);
+            options.AddEnvironmentVariable("_NT_SYMBOL_PATH", symbolPath);
+            options.AddOutputStream(log);
             options.AddNoThrow();
 
             options.AddEnvironmentVariable("COMPLUS_NGenEnableCreatePdb", "1");
@@ -633,12 +657,12 @@ namespace Microsoft.Diagnostics.Symbols
             m = Regex.Match(ngenImageFullPath, @"(.*)\\Microsoft\\CLR_v(\d+)\.\d+(_(\d\d))?\\NativeImages", RegexOptions.IgnoreCase);
             if (m.Success)
             {
-                tempDir = Path.Combine(m.Groups[1].Value, @"Temp\NGenPdb");
+                tempDir = Path.Combine(Path.GetTempPath(), "NGenPdb", Path.GetRandomFileName());
                 DirectoryUtilities.Clean(tempDir);
                 Directory.CreateDirectory(tempDir);
                 ngenOutputDirectory = tempDir;
                 outputPdbPath = Path.Combine(tempDir, relDirPath, pdbFileName);
-                m_log.WriteLine("Updating NGEN createPdb output file to {0}", outputPdbPath); // TODO FIX NOW REMOVE (for debugging)
+                log.WriteLine("Updating NGEN createPdb output file to {0}", outputPdbPath); // TODO FIX NOW REMOVE (for debugging)
             }
 
             // TODO: Hack.   V4.6.1 has both these characteristics, which leads to the issue
@@ -647,7 +671,7 @@ namespace Microsoft.Diagnostics.Symbols
             // Should be fixed by 12/2015
             if (isV4_5Runtime)
             {
-                InsurePathIsInNIC(m_log, ref ngenImageFullPath);
+                InsurePathIsInNIC(log, ref ngenImageFullPath);
             }
 
             try
@@ -656,8 +680,8 @@ namespace Microsoft.Diagnostics.Symbols
                 {
                     if (!string.IsNullOrEmpty(privateRuntimeVerString))
                     {
-                        m_log.WriteLine("Ngen will run for private runtime ", privateRuntimeVerString);
-                        m_log.WriteLine("set COMPLUS_Version=" + privateRuntimeVerString);
+                        log.WriteLine("Ngen will run for private runtime ", privateRuntimeVerString);
+                        log.WriteLine("set COMPLUS_Version=" + privateRuntimeVerString);
                         options.AddEnvironmentVariable("COMPLUS_Version", privateRuntimeVerString);
                     }
                     // TODO FIX NOW: there is a and ugly problem with persistence of suboptimal PDB files
@@ -668,17 +692,17 @@ namespace Microsoft.Diagnostics.Symbols
                     var cmdLine = string.Format(@"{0}\ngen.exe createpdb {1} {2} {3}",
                         clrDir, Command.Quote(ngenImageFullPath), Command.Quote(ngenOutputDirectory), lineNumberArg);
                     // TODO FIX NOW REMOVE after V4.5 is out a while
-                    m_log.WriteLine("set COMPLUS_NGenEnableCreatePdb=1");
+                    log.WriteLine("set COMPLUS_NGenEnableCreatePdb=1");
                     if (!isV4_5Runtime)
                     {
-                        m_log.WriteLine("set COMPLUS_NGenLocalWorker=1");
+                        log.WriteLine("set COMPLUS_NGenLocalWorker=1");
                     }
 
-                    m_log.WriteLine("set PATH=" + newPath);
-                    m_log.WriteLine("set _NT_SYMBOL_PATH={0}", SymbolPath);
-                    m_log.WriteLine("*** NGEN  CREATEPDB cmdline: {0}\r\n", cmdLine);
+                    log.WriteLine("set PATH=" + newPath);
+                    log.WriteLine("set _NT_SYMBOL_PATH={0}", symbolPath);
+                    log.WriteLine("*** NGEN  CREATEPDB cmdline: {0}\r\n", cmdLine);
                     var cmd = Command.Run(cmdLine, options);
-                    m_log.WriteLine("*** NGEN CREATEPDB returns: {0}", cmd.ExitCode);
+                    log.WriteLine("*** NGEN CREATEPDB returns: {0}", cmd.ExitCode);
 
                     if (cmd.ExitCode != 0)
                     {
@@ -691,7 +715,7 @@ namespace Microsoft.Diagnostics.Symbols
                         // We may have failed because we could not get the PDB.  
                         if (lineNumberArg.Length != 0)
                         {
-                            m_log.WriteLine("Ngen failed to generate pdb for {0}, trying again without /lines", ngenImageFullPath);
+                            log.WriteLine("Ngen failed to generate pdb for {0}, trying again without /lines", ngenImageFullPath);
                             lineNumberArg = "";
                             continue;
                         }
@@ -699,7 +723,7 @@ namespace Microsoft.Diagnostics.Symbols
 
                     if (cmd.ExitCode != 0 || !File.Exists(outputPdbPath))
                     {
-                        m_log.WriteLine("ngen failed to generate pdb for {0} at expected location {1}", ngenImageFullPath, outputPdbPath);
+                        log.WriteLine("ngen failed to generate pdb for {0} at expected location {1}", ngenImageFullPath, outputPdbPath);
                         return null;
                     }
 
@@ -723,18 +747,18 @@ namespace Microsoft.Diagnostics.Symbols
         }
 
         /// <summary>
-        /// Given a NGEN (or ReadyToRun) imge 'ngenImageFullPath' and the PDB path
+        /// Given a NGEN (or ReadyToRun) image 'ngenImageFullPath' and the PDB path
         /// that we WANT it to generate generate the PDB.  Returns either pdbPath 
         /// on success or null on failure.  
         /// 
         /// TODO can be removed when we properly publish the NGEN pdbs as part of build.  
         /// </summary>
-        private string HandleNetCorePdbs(string ngenImageFullPath, string pdbPath)
+        private static string HandleNetCorePdbs(string ngenImageFullPath, string pdbPath, TextWriter log)
         {
             // We only handle NGEN PDB. 
             if (!pdbPath.EndsWith(".ni.pdb", StringComparison.OrdinalIgnoreCase))
             {
-                m_log.WriteLine("Not a crossGen PDB {0}", pdbPath);
+                log.WriteLine("Not a crossGen PDB {0}", pdbPath);
                 return null;
             }
 
@@ -742,10 +766,10 @@ namespace Microsoft.Diagnostics.Symbols
             var pdbDir = Path.GetDirectoryName(pdbPath);
 
             // We need Crossgen, and there are several options, see what we can do. 
-            string crossGen = GetCrossGenExePath(ngenImageFullPath);
+            string crossGen = GetCrossGenExePath(ngenImageFullPath, log);
             if (crossGen == null)
             {
-                m_log.WriteLine("Could not find Crossgen.exe to generate PDBs, giving up.");
+                log.WriteLine("Could not find Crossgen.exe to generate PDBs, giving up.");
                 return null;
             }
 
@@ -775,7 +799,7 @@ namespace Microsoft.Diagnostics.Symbols
                 " " + Command.Quote(crossGenInputName);
 
             var options = new CommandOptions();
-            options.AddOutputStream(m_log);
+            options.AddOutputStream(log);
             options.AddNoThrow();
 
             // Needs diasymreader.dll to be on the path.  
@@ -783,9 +807,9 @@ namespace Microsoft.Diagnostics.Symbols
                 winDir + @"\Microsoft.NET\Framework64\v4.0.30319" + ";%PATH%";
             options.AddEnvironmentVariable("PATH", newPath);
             options.AddCurrentDirectory(ngenImageDir);
-            m_log.WriteLine("**** Running CrossGen");
-            m_log.WriteLine("set PATH=" + newPath);
-            m_log.WriteLine("{0}\r\n", cmdLine);
+            log.WriteLine("**** Running CrossGen");
+            log.WriteLine("set PATH=" + newPath);
+            log.WriteLine("{0}\r\n", cmdLine);
             var cmd = Command.Run(cmdLine, options);
 
             // Delete the temporary file if necessary
@@ -796,7 +820,7 @@ namespace Microsoft.Diagnostics.Symbols
 
             if (cmd.ExitCode != 0 || !File.Exists(pdbPath))
             {
-                m_log.WriteLine("CrossGen failed to generate {0} exit code {0}", pdbPath, cmd.ExitCode);
+                log.WriteLine("CrossGen failed to generate {0} exit code {0}", pdbPath, cmd.ExitCode);
                 return null;
             }
 
@@ -826,12 +850,12 @@ namespace Microsoft.Diagnostics.Symbols
             return nugetPackageDir;
         }
 
-        private string GetCrossGenExePath(string ngenImageFullPath)
+        private static string GetCrossGenExePath(string ngenImageFullPath, TextWriter log)
         {
             var imageDir = Path.GetDirectoryName(ngenImageFullPath);
             string crossGen = Path.Combine(imageDir, "crossGen.exe");
 
-            m_log.WriteLine("Checking for CoreCLR case, looking for CrossGen at {0}", crossGen);
+            log.WriteLine("Checking for CoreCLR case, looking for CrossGen at {0}", crossGen);
             if (File.Exists(crossGen))
             {
                 return crossGen;
@@ -841,11 +865,11 @@ namespace Microsoft.Diagnostics.Symbols
             if (File.Exists(coreclr))
             {
                 DateTime coreClrTimeStamp = File.GetLastWriteTimeUtc(coreclr);
-                m_log.WriteLine("Found coreclr: at  {0}, timestamp {1}", coreclr, coreClrTimeStamp);
+                log.WriteLine("Found coreclr: at  {0}, timestamp {1}", coreclr, coreClrTimeStamp);
                 string nugetDir = getNugetPackageDir();
                 if (nugetDir != null)
                 {
-                    m_log.WriteLine("Found nuget package dir: at  {0}", nugetDir);
+                    log.WriteLine("Found nuget package dir: at  {0}", nugetDir);
                     foreach (var runtimeDir in Directory.GetDirectories(nugetDir, "runtime.win*.microsoft.netcore.runtime.coreclr"))
                     {
                         foreach (var runtimeVersionDir in Directory.GetDirectories(runtimeDir))
@@ -854,11 +878,11 @@ namespace Microsoft.Diagnostics.Symbols
                             {
                                 string packageCoreCLR = Path.Combine(osarchDir, @"native\coreclr.dll");
                                 DateTime packageCoreClrTimeStamp = File.GetLastWriteTimeUtc(packageCoreCLR);
-                                m_log.WriteLine("Checking timestamp of file {0} = {1}", packageCoreCLR, packageCoreClrTimeStamp);
+                                log.WriteLine("Checking timestamp of file {0} = {1}", packageCoreCLR, packageCoreClrTimeStamp);
                                 if (File.Exists(packageCoreCLR) && packageCoreClrTimeStamp == coreClrTimeStamp)
                                 {
                                     crossGen = Path.Combine(runtimeVersionDir, @"tools\crossgen.exe");
-                                    m_log.WriteLine("Found matching CoreCLR, probing for crossgen at {0}", crossGen);
+                                    log.WriteLine("Found matching CoreCLR, probing for crossgen at {0}", crossGen);
                                     if (File.Exists(crossGen))
                                     {
                                         return crossGen;
@@ -881,12 +905,12 @@ namespace Microsoft.Diagnostics.Symbols
                 }
             }
 
-            m_log.WriteLine("Could not find crossgen, giving up");
+            log.WriteLine("Could not find crossgen, giving up");
             return null;
         }
 
         // TODO remove after 12/2015
-        private void InsurePathIsInNIC(TextWriter log, ref string ngenImageFullPath)
+        private static void InsurePathIsInNIC(TextWriter log, ref string ngenImageFullPath)
         {
             // We only get called if we are 4.5. or beyond, so we should have AUX files if we are in the nic.  
             string auxFilePath = ngenImageFullPath + ".aux";
@@ -938,6 +962,12 @@ namespace Microsoft.Diagnostics.Symbols
         public void Dispose()
         {
             m_symbolModuleCache.Clear();
+
+            if (HttpClient != null)
+            {
+                HttpClient.Dispose();
+                HttpClient = null;
+            }
         }
 
         #region private
@@ -986,7 +1016,7 @@ namespace Microsoft.Diagnostics.Symbols
         }
 
         /// <summary>
-        /// Fetches a file from the server 'serverPath' with pdb signature path 'pdbSigPath' (concatinate them with a / or \ separator
+        /// Fetches a file from the server 'serverPath' with pdb signature path 'pdbSigPath' (concatenate them with a / or \ separator
         /// to form a complete URL or path name).   It will place the file in 'fullDestPath'   It will return true if successful
         /// If 'contentTypeFilter is present, this predicate is called with the URL content type (e.g. application/octet-stream)
         /// and if it returns false, it fails.   This ensures that things that are the wrong content type (e.g. redirects to 
@@ -997,7 +1027,7 @@ namespace Microsoft.Diagnostics.Symbols
         /// <param name="serverPath">path to server (e.g. \\symbols\symbols or http://symweb) </param>
         /// <param name="pdbIndexPath">pdb path with signature (e.g clr.pdb/1E18F3E494DC464B943EA90F23E256432/clr.pdb)</param>
         /// <param name="fullDestPath">the full path of where to put the file locally </param>
-        /// <param name="contentTypeFilter">if present this allows you to filter out urls that dont match this ContentType.</param>
+        /// <param name="contentTypeFilter">if present this allows you to filter out URLs that don't match this ContentType.</param>
         internal bool GetPhysicalFileFromServer(string serverPath, string pdbIndexPath, string fullDestPath, Predicate<string> contentTypeFilter = null)
         {
             if (File.Exists(fullDestPath))
@@ -1037,25 +1067,23 @@ namespace Microsoft.Diagnostics.Symbols
                         {
                             m_log.WriteLine("FindSymbolFilePath: In task, sending HTTP request {0}", fullUri);
 
-                            var req = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(fullUri);
-#if !NETSTANDARD1_6
-                            // Some symbol servers want a user agent and simply fail if they don't have one (see https://github.com/Microsoft/perfview/issues/571)
-                            // So set it (this is what the symsrv code on Windows sets).   On NetStandard1.6 we give up since we dont' have this API available.  
-                            req.UserAgent = "Microsoft-Symbol-Server/6.13.0009.1140";
-#endif
-                            var responseTask = req.GetResponseAsync();
+                            var responseTask = HttpClient.GetAsync(fullUri);
                             responseTask.Wait();
-                            var response = responseTask.Result;
+                            var response = responseTask.Result.EnsureSuccessStatusCode();
 
                             alive = true;
                             if (!canceled)
                             {
-                                if (contentTypeFilter != null && !contentTypeFilter(response.ContentType))
+                                var contentType = response.Content.Headers.ContentType;
+                                if (contentTypeFilter != null && contentType != null && !contentTypeFilter(contentType.ToString()))
                                 {
-                                    throw new InvalidOperationException("Bad File Content type " + response.ContentType + " for " + fullDestPath);
+                                    throw new InvalidOperationException("Bad File Content type " + contentType + " for " + fullDestPath);
                                 }
 
-                                using (var fromStream = response.GetResponseStream())
+                                var responseStreamTask = response.Content.ReadAsStreamAsync();
+                                responseStreamTask.Wait();
+
+                                using (var fromStream = responseStreamTask.Result)
                                 {
                                     if (CopyStreamToFile(fromStream, fullUri, fullDestPath, ref canceled) == 0)
                                     {
@@ -1071,21 +1099,7 @@ namespace Microsoft.Diagnostics.Symbols
                         {
                             if (!canceled)
                             {
-                                var asWeb = e as WebException;
-                                var sentMessage = false;
-                                if (asWeb != null)
-                                {
-                                    var asHttpResonse = asWeb.Response as HttpWebResponse;
-                                    if (asHttpResonse != null && asHttpResonse.StatusCode == HttpStatusCode.NotFound)
-                                    {
-                                        sentMessage = true;
-                                        m_log.WriteLine("FindSymbolFilePath: Probe of {0} was not found.", fullUri);
-                                    }
-                                }
-                                if (!sentMessage)
-                                {
-                                    m_log.WriteLine("FindSymbolFilePath: Probe of {0} failed: {1}", fullUri, e.Message);
-                                }
+                                m_log.WriteLine("FindSymbolFilePath: Probe of {0} failed: {1}", fullUri, e.Message);
                             }
                         }
                     }
@@ -1121,12 +1135,8 @@ namespace Microsoft.Diagnostics.Symbols
                     }
                 });
 
-                // Wait 10 seconds allowing for interruptions.  
-                var limit = 100;
-                if (serverPath.StartsWith(@"\\symbols", StringComparison.OrdinalIgnoreCase))     // This server is pretty slow.  
-                {
-                    limit = 250;
-                }
+                // Wait 25 seconds allowing for interruptions.
+                var limit = 250;
 
                 for (int i = 0; i < limit; i++)
                 {
@@ -1204,12 +1214,15 @@ namespace Microsoft.Diagnostics.Symbols
         }
 
         /// <summary>
-        /// This just copies a stream to a file path with logging.  
+        /// This just copies a stream to a file path with logging.
         /// </summary>
-        private int CopyStreamToFile(Stream fromStream, string fromUri, string fullDestPath, ref bool canceled)
+        /// <returns>
+        /// The total number of bytes copied.
+        /// </returns>
+        private long CopyStreamToFile(Stream fromStream, string fromUri, string fullDestPath, ref bool canceled)
         {
             bool completed = false;
-            int byteCount = 0;
+            long byteCount = 0;
             var copyToFileName = fullDestPath + ".new";
             try
             {
@@ -1217,11 +1230,11 @@ namespace Microsoft.Diagnostics.Symbols
                 Directory.CreateDirectory(dirName);
                 m_log.WriteLine("CopyStreamToFile: Copying {0} to {1}", fromUri, copyToFileName);
                 var sw = Stopwatch.StartNew();
-                int lastMeg = 0;
-                int last10K = 0;
+                long lastMeg = 0;
+                long last10K = 0;
                 using (Stream toStream = File.Create(copyToFileName))
                 {
-                    byte[] buffer = new byte[8192];
+                    byte[] buffer = new byte[81920];
                     for (; ; )
                     {
                         int count = fromStream.Read(buffer, 0, buffer.Length);
@@ -1238,16 +1251,18 @@ namespace Microsoft.Diagnostics.Symbols
                             m_log.Write(".");
                             last10K += 10000;
                         }
+
                         if (byteCount - lastMeg >= 1000000)
                         {
                             m_log.WriteLine(" {0:f1} Meg", byteCount / 1000000.0);
                             m_log.Flush();
                             lastMeg += 1000000;
                         }
+
                         if (sw.Elapsed.TotalMilliseconds > 100)
                         {
                             m_log.Flush();
-                            System.Threading.Thread.Sleep(0);       // allow interruption.
+                            Thread.Sleep(0);       // allow interruption.
                             sw.Restart();
                         }
 
@@ -1257,6 +1272,7 @@ namespace Microsoft.Diagnostics.Symbols
                         }
                     }
                 }
+
                 if (!canceled)
                 {
                     completed = true;
@@ -1276,6 +1292,7 @@ namespace Microsoft.Diagnostics.Symbols
                     FileUtilities.ForceDelete(copyToFileName);
                 }
             }
+
             return byteCount;
         }
 
@@ -1339,12 +1356,12 @@ namespace Microsoft.Diagnostics.Symbols
             {
                 // Decompress it
                 m_log.WriteLine("FindSymbolFilePath: Expanding {0} to {1}", compressedFilePath, targetPath);
-                var commandline = "Expand " + Command.Quote(compressedFilePath) + " " + Command.Quote(targetPath);
+                var commandLine = "Expand " + Command.Quote(compressedFilePath) + " " + Command.Quote(targetPath);
                 var options = new CommandOptions().AddNoThrow();
-                var command = Command.Run(commandline, options);
+                var command = Command.Run(commandLine, options);
                 if (command.ExitCode != 0)
                 {
-                    m_log.WriteLine("FindSymbolFilePath: Failure executing: {0}", commandline);
+                    m_log.WriteLine("FindSymbolFilePath: Failure executing: {0}", commandLine);
                     return null;
                 }
                 File.Delete(compressedFilePath);
@@ -1431,8 +1448,8 @@ namespace Microsoft.Diagnostics.Symbols
             string majorVersion;            // a small integer (e.g. 4)
             privateRuntimeVerStr = null;
             // Set the default bitness
-            string bitness;            // Either "64" or ""
-            var m = Regex.Match(ngenImagePath, @"^(.*)\\assembly\\NativeImages_(v(\d+)[\dA-Za-z.]*)_(\d\d)\\", RegexOptions.IgnoreCase);
+            string bitness;            // "ARM64", "64", or ""
+            var m = Regex.Match(ngenImagePath, @"^(.*)\\assembly\\NativeImages_(v(\d+)[\dA-Za-z.]*)_((\d\d)|(ARM64))\\", RegexOptions.IgnoreCase);
             if (m.Success)
             {
                 var basePath = m.Groups[1].Value;
@@ -1484,12 +1501,12 @@ namespace Microsoft.Diagnostics.Symbols
 
             var winDir = Environment.GetEnvironmentVariable("winDir");
 
-            if (bitness != "64")
+            if (bitness != "64" && !bitness.Equals("ARM64", StringComparison.OrdinalIgnoreCase))
             {
                 bitness = "";
             }
 
-            Debug.Assert(bitness == "64" || bitness == "");
+            Debug.Assert(bitness == "64" || bitness == "" || bitness == "ARM64" || bitness == "arm64");
 
             var frameworkDir = Path.Combine(winDir, @"Microsoft.NET\Framework" + bitness);
             var candidates = Directory.GetDirectories(frameworkDir, "v" + majorVersion + ".*");
@@ -1580,7 +1597,7 @@ namespace Microsoft.Diagnostics.Symbols
         // Used as the key to the m_pdbPathCache.  
         private struct PdbSignature : IEquatable<PdbSignature>
         {
-            public override int GetHashCode() { return Name.GetHashCode() + ID.GetHashCode(); }
+            public override int GetHashCode() { return unchecked(Name.GetHashCode() + ID.GetHashCode()); }
             public bool Equals(PdbSignature other) { return ID == other.ID && Name == other.Name && Age == other.Age; }
             public string Name;
             public Guid ID;
@@ -1602,7 +1619,7 @@ namespace Microsoft.Diagnostics.Symbols
     /// <summary>
     /// A SymbolModule represents a file that contains symbolic information 
     /// (a Windows PDB or Portable PDB).  This is the interface that is independent 
-    /// of what kind of symbolic file format you use.  Becase portable PDBs only
+    /// of what kind of symbolic file format you use.  Because portable PDBs only
     /// support managed code, this shared interface is by necessity the interface
     /// for managed code only (currently only Windows PDBs support native code).  
     /// </summary>
@@ -1639,7 +1656,7 @@ namespace Microsoft.Diagnostics.Symbols
         public abstract SourceLocation SourceLocationForManagedCode(uint methodMetadataToken, int ilOffset);
 
         /// <summary>
-        /// If the symbol file format supports SourceLink JSON this routine should be overriden
+        /// If the symbol file format supports SourceLink JSON this routine should be overridden
         /// to return it.  
         /// </summary>
         protected virtual IEnumerable<string> GetSourceLinkJson() { return Enumerable.Empty<string>(); }
@@ -1680,7 +1697,7 @@ namespace Microsoft.Diagnostics.Symbols
                     if (buildTimeFilePath.StartsWith(path, StringComparison.OrdinalIgnoreCase))
                     {
                         relativeFilePath = buildTimeFilePath.Substring(path.Length, buildTimeFilePath.Length - path.Length).Replace('\\', '/');
-                        url = urlReplacement.Replace("*", relativeFilePath);
+                        url = urlReplacement.Replace("*", string.Join("/", relativeFilePath.Split('/').Select(Uri.EscapeDataString)));
                         return true;
                     }
                 }
@@ -1832,13 +1849,13 @@ namespace Microsoft.Diagnostics.Symbols
         /// can be used to fetch it with HTTP Get), then return that Url.   If no such publishing 
         /// point exists this property will return null.   
         /// </summary>
-        public virtual string Url 
-        { 
-            get 
+        public virtual string Url
+        {
+            get
             {
                 this.GetSourceLinkInfo(out string url, out _);
                 return url;
-            } 
+            }
         }
 
         /// <summary>
@@ -2006,42 +2023,34 @@ namespace Microsoft.Diagnostics.Symbols
             string url = Url;
             if (url != null)
             {
-                using (var httpClient = new HttpClient())
+                var httpClient = _symbolModule.SymbolReader.HttpClient;
+                HttpResponseMessage response = httpClient.GetAsync(url).Result;
+
+                response.EnsureSuccessStatusCode();
+                Stream content = response.Content.ReadAsStreamAsync().Result;
+
+                if (this._sha256 == null)
                 {
-                    var authorizationHeader = this._symbolModule.SymbolReader.AuthorizationHeaderForSourceLink;
-                    if (authorizationHeader != null)
+                    this._sha256 = SHA256.Create();
+                }
+
+                string cachedLocation = Path.Combine(
+                    _symbolModule.SymbolReader.SourceCacheDirectory,
+                    BitConverter.ToString(this._sha256.ComputeHash(Encoding.UTF8.GetBytes(url.ToUpperInvariant())))
+                        .Replace("-", string.Empty));
+                if (cachedLocation != null)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(cachedLocation));
+                    using (FileStream file = File.Create(cachedLocation))
                     {
-                        httpClient.DefaultRequestHeaders.Add("Authorization", authorizationHeader);
+                        content.CopyTo(file);
                     }
 
-                    HttpResponseMessage response = httpClient.GetAsync(url).Result;
-
-                    response.EnsureSuccessStatusCode();
-                    Stream content = response.Content.ReadAsStreamAsync().Result;
-
-                    if (this._sha256 == null)
-                    {
-                        this._sha256 = SHA256.Create();
-                    }
-
-                    string cachedLocation = Path.Combine(
-                        _symbolModule.SymbolReader.SourceCacheDirectory,
-                        BitConverter.ToString(this._sha256.ComputeHash(Encoding.UTF8.GetBytes(url.ToUpperInvariant())))
-                            .Replace("-", string.Empty));
-                    if (cachedLocation != null)
-                    {
-                        Directory.CreateDirectory(Path.GetDirectoryName(cachedLocation));
-                        using (FileStream file = File.Create(cachedLocation))
-                        {
-                            content.CopyTo(file);
-                        }
-
-                        return cachedLocation;
-                    }
-                    else
-                    {
-                        _log.WriteLine("Warning: SourceCache not set, giving up fetching source from the network.");
-                    }
+                    return cachedLocation;
+                }
+                else
+                {
+                    _log.WriteLine("Warning: SourceCache not set, giving up fetching source from the network.");
                 }
             }
             return null;
@@ -2078,7 +2087,7 @@ namespace Microsoft.Diagnostics.Symbols
                 return true;
             }
 
-            // If we don't match but we have nothinging better, remember it.   Otherwise do nothing as first hit is better.  
+            // If we don't match but we have nothing better, remember it.   Otherwise do nothing as first hit is better.  
             if (_filePath == null)
             {
                 _filePath = filePath;
@@ -2094,7 +2103,7 @@ namespace Microsoft.Diagnostics.Symbols
         }
 
         /// <summary>
-        /// Returns true if 'filePath' matches the checksum OR we don't have a checkdum
+        /// Returns true if 'filePath' matches the checksum OR we don't have a checksum
         /// (thus if we pass what validity check we have).    
         /// </summary>
         private bool ComputeChecksumMatch(string filePath)
@@ -2107,7 +2116,153 @@ namespace Microsoft.Diagnostics.Symbols
             using (var fileStream = File.OpenRead(filePath))
             {
                 byte[] computedHash = _hashAlgorithm.ComputeHash(fileStream);
-                return ArrayEquals(computedHash, _hash);
+                if (ArrayEquals(computedHash, _hash))
+                {
+                    return true;
+                }
+
+                // It's possible we have a line ending mismatch (e.g. the hash was computed
+                // with Windows (CR+LF) line endings, but the source control system
+                // converted to Unix (LF) endings or vice versa). So try the other line ending.
+                fileStream.Position = 0;
+                computedHash = ComputeHashWithSwappedLineEndings(fileStream);
+                if (ArrayEquals(computedHash, _hash))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private byte[] ComputeHashWithSwappedLineEndings(FileStream fs)
+        {
+            // Use a stream reader to determine the encoding. 
+            // The underlying stream is not closed. Default to UTF8 is heuristic
+            Encoding encoding = Encoding.UTF8;
+            using (var streamReader = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 8, leaveOpen: true))
+            {
+                streamReader.Peek(); // required to set the encoding
+                encoding = streamReader.CurrentEncoding;
+            }
+
+            // StreamReader.Peek does not change the position of the stream reader but does change the position
+            // of the underlying stream. Reset it
+            fs.Position = 0;
+
+            // If the file is not a common encoding don't bother attempting to normalize
+            if (!(encoding is UTF8Encoding) &&
+                !(encoding is UnicodeEncoding) &&
+                !(encoding is ASCIIEncoding))
+            {
+                return null;
+            }
+
+            using (var reader = new BinaryReader(fs, encoding, leaveOpen: true))
+            {
+                const char CRchar = '\r';
+                const char LFchar = '\n';
+
+                // Determine first line ending
+                LineEnding lineEnding = LineEnding.CRLF;
+                try
+                {
+                    // Using a label and a goto in the default case
+                    // so that we can easily break out of the other
+                    // case statements.
+                    loop: switch (reader.ReadChar())
+                    {
+                        case CRchar:
+                            lineEnding = LineEnding.CRLF;
+                            break;
+
+                        case LFchar:
+                            lineEnding = LineEnding.LF;
+                            break;
+
+                        default:
+                            goto loop;
+                    }
+                }
+                catch (EndOfStreamException)
+                {
+                    // no line ending in file. loop below will be fine
+                }
+
+                // Use an IncrementalHash and append data line at a time so
+                // we can modify the line endings as we go.
+                fs.Position = 0;
+                using (var hasher = IncrementalHash.CreateHash(new HashAlgorithmName(ChecksumAlgorithm)))
+                {
+
+                    // These will capture the characters of the file which we will serialize to bytes
+                    // using the Encoding and append to the incremental hash on each line ending
+                    StringBuilder line = new StringBuilder();
+
+                    // Local function to append a line's worth of data to the hasher.
+                    void AppendLine()
+                    {
+                        byte[] data = encoding.GetBytes(line.ToString());
+                        hasher.AppendData(data, 0, data.Length);
+                    }
+
+                    try
+                    {
+                        while (true) // Loop until EndOfStreamException
+                        {
+                            char nextChar = reader.ReadChar();
+                            switch (nextChar)
+                            {
+                                default:
+                                    line.Append(nextChar);
+                                    break;
+
+                                case CRchar:
+                                    // We found a CR. Assume this file is CRLF and we want to normalize to LF
+                                    if (lineEnding == LineEnding.LF)
+                                    {
+                                        // Mixed line endings
+                                        return null;
+                                    }
+
+                                    nextChar = reader.ReadChar();
+                                    if (nextChar != LFchar)
+                                    {
+                                        // CR not followed by LF
+                                        return null;
+                                    }
+
+                                    line.Append(LFchar);
+                                    AppendLine();
+                                    line.Clear();
+                                    break;
+
+                                case LFchar:
+                                    // We found an LF. Assume this file is LF and want to normalize to CRLF
+                                    if (lineEnding == LineEnding.CRLF)
+                                    {
+                                        // Mixed line endings
+                                        return null;
+                                    }
+
+                                    line.Append(CRchar);
+                                    line.Append(LFchar);
+                                    AppendLine();
+                                    line.Clear();
+                                    break;
+                            }
+                        }
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        // We successfully normalized the entire file.
+                        // Grab remaining bytes in the case that the file does not end
+                        // with a line ending character.
+                        AppendLine();
+                    }
+
+                    return hasher.GetHashAndReset();
+                }
             }
         }
 
@@ -2139,6 +2294,18 @@ namespace Microsoft.Diagnostics.Symbols
         protected string _filePath;
         private bool _getSourceCalled;
         private bool _checksumMatches;
+
+        /// <summary>
+        /// The different line endings we support for computing file hashes.
+        /// </summary>
+        private enum LineEnding
+        {
+            // Windows-style CR LF (\r\n)
+            CRLF,
+
+            // Unix-style LF (\n)
+            LF
+        }
         #endregion
     }
 }

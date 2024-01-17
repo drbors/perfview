@@ -10,22 +10,18 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
         private CtfMetadata _metadata;
         private CtfStream _ctfStream;
         private Stream _stream;
+        private long _position;
         private byte[] _buffer = new byte[256];
         private GCHandle _handle;
         private long _packetSize;
         private long _contentSize;
-
-#if DEBUG
-        private long _fileOffset;
-
-        public long FileOffset { get { return _fileOffset; } }
-#endif
 
         public CtfStream CtfStream { get { return _ctfStream; } }
 
         public CtfChannel(Stream stream, CtfMetadata metadata)
         {
             _stream = stream;
+            _position = 0;
             _metadata = metadata;
             _handle = GCHandle.Alloc(_buffer, GCHandleType.Pinned);
 
@@ -49,12 +45,14 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
                 {
                     // Zip filestream can't seek, we have to read the rest of the packet.
 
-                    int curr = _buffer.Length < _packetSize ? _buffer.Length : (int)_packetSize;
-                    _stream.Read(_buffer, 0, curr);
-                    _packetSize -= curr;
-#if DEBUG
-                    _fileOffset += curr;
-#endif
+                    int toRead = _buffer.Length <= _packetSize ? _buffer.Length : (int)_packetSize;
+                    int read = _stream.Read(_buffer, 0, toRead);
+                    _packetSize -= read;
+                    _position += read;
+                    if (read != toRead)
+                    {
+                        return false;
+                    }
                 }
 
                 if (!ReadTraceHeader())
@@ -99,14 +97,12 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
             streamIdOffset /= 8;
             traceHeaderSize /= 8;
 
-            if (_stream.Read(_buffer, 0, traceHeaderSize) != traceHeaderSize)
+            if (TryReadExactlyCount(_buffer, 0, traceHeaderSize) != traceHeaderSize)
             {
                 return false;
             }
 
-#if DEBUG
-            _fileOffset += traceHeaderSize;
-#endif
+            _position += traceHeaderSize;
 
             uint magic = BitConverter.ToUInt32(_buffer, magicOffset);
             if (magic != 0xc1fc1fc1)
@@ -147,14 +143,12 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
             contentSizeOffset /= 8;
             packetSizeOffset /= 8;
 
-            if (_stream.Read(_buffer, 0, packetContextSize) != packetContextSize)
+            if (TryReadExactlyCount(_buffer, 0, packetContextSize) != packetContextSize)
             {
                 return false;
             }
 
-#if DEBUG
-            _fileOffset += packetContextSize;
-#endif
+            _position += packetContextSize;
 
             int headerSize = (_metadata.Trace.Header.GetSize() / 8) + packetContextSize;
             _contentSize = (long)BitConverter.ToUInt64(_buffer, contentSizeOffset) / 8 - headerSize;
@@ -171,11 +165,9 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
         private bool ReadStruct<T>(out T result) where T : struct
         {
             int size = Marshal.SizeOf(typeof(T));
-            int read = _stream.Read(_buffer, 0, size);
+            int read = TryReadExactlyCount(_buffer, 0, size);
 
-#if DEBUG
-            _fileOffset += read;
-#endif
+            _position += read;
 
             if (size != read)
             {
@@ -195,6 +187,18 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
             }
         }
 
+        public override long Position
+        {
+            get
+            {
+                return _position;
+            }
+
+            set
+            {
+                throw new NotSupportedException();
+            }
+        }
 
         public override int ReadByte()
         {
@@ -206,11 +210,10 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
             _contentSize--;
             _packetSize--;
             int value = _stream.ReadByte();
-
-#if DEBUG
             if (value != -1)
-                _fileOffset++;
-#endif
+            {
+                _position++;
+            }
 
             Debug.Assert(value != -1);
             return value;
@@ -218,32 +221,34 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            int read = 0;
-            while (read < count)
+            if (_contentSize == 0 && !ReadContext())
             {
-                if (_contentSize == 0 && !ReadContext())
-                {
-                    break;
-                }
-
-                int toRead = count > _contentSize ? (int)_contentSize : count;
-                int curr = _stream.Read(buffer, offset + read, toRead);
-
-                _contentSize -= curr;
-                _packetSize -= curr;
-                read += curr;
-
-#if DEBUG
-                _fileOffset += curr;
-#endif
-
-                if (curr != toRead)
-                {
-                    break;
-                }
+                return 0;
             }
 
+            int toRead = count > _contentSize ? (int)_contentSize : count;
+            int read = TryReadExactlyCount(buffer, offset, toRead);
+
+            _contentSize -= read;
+            _packetSize -= read;
+            _position += read;
+
             return read;
+        }
+
+        private int TryReadExactlyCount(byte[] buffer, int offset, int count)
+        {
+            int totalRead = 0;
+            while (totalRead < count)
+            {
+                var read = _stream.Read(buffer, offset + totalRead, count - totalRead);
+                if (read == 0)
+                {
+                    return totalRead;
+                }
+                totalRead += read;
+            }
+            return totalRead;
         }
 
         #region Not Implemented
@@ -266,19 +271,6 @@ namespace Microsoft.Diagnostics.Tracing.Ctf
         public override long Length
         {
             get
-            {
-                throw new NotImplementedException();
-            }
-        }
-
-        public override long Position
-        {
-            get
-            {
-                throw new NotImplementedException();
-            }
-
-            set
             {
                 throw new NotImplementedException();
             }

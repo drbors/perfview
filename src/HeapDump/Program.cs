@@ -14,8 +14,6 @@ internal class Program
 {
     private static int Main(string[] args)
     {
-        // This EXE lives in the architecture specific directory but uses TraceEvent which lives in the neutral directory, 
-        // Set up a resolve event that finds this DLL.  
         AppDomain.CurrentDomain.AssemblyResolve += delegate (object sender, ResolveEventArgs resolveArgs)
         {
             var simpleName = resolveArgs.Name;
@@ -27,7 +25,16 @@ internal class Program
 
             var exeAssembly = System.Reflection.Assembly.GetExecutingAssembly();
             var parentDir = Path.GetDirectoryName(Path.GetDirectoryName(exeAssembly.ManifestModule.FullyQualifiedName));
-            string fileName = Path.Combine(parentDir, simpleName + ".dll");
+
+            // Check the HeapDump IL dependencies directory.
+            string fileName = Path.Combine(parentDir, "HeapDump", simpleName + ".dll");
+            if (File.Exists(fileName))
+            {
+                return System.Reflection.Assembly.LoadFrom(fileName);
+            }
+
+            // Check the parent directory (for shared dependencies such as TraceEvent.dll).
+            fileName = Path.Combine(parentDir, simpleName + ".dll");
             if (File.Exists(fileName))
             {
                 return System.Reflection.Assembly.LoadFrom(fileName);
@@ -45,7 +52,7 @@ internal class Program
         int exceptionExitCode = 1;
         try
         {
-            float decayToZeroHours = 0;
+            double decayToZeroHours = 0;
             bool forceGC = false;
             bool processDump = false;
             string inputSpec = null;
@@ -117,7 +124,7 @@ internal class Program
                     }
                     else if (arg.StartsWith("/DecayToZeroHours:", StringComparison.OrdinalIgnoreCase))
                     {
-                        decayToZeroHours = float.Parse(arg.Substring(18));
+                        decayToZeroHours = double.Parse(arg.Substring(18));
                     }
                     else if (arg.StartsWith("/StopOnPerfCounter:", StringComparison.OrdinalIgnoreCase))
                     {

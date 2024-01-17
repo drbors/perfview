@@ -52,6 +52,7 @@ namespace PerfView
 
         public bool CommandLineCommand;
         public bool CollectingData;
+        public bool StopInProgress;
         public TextWriter LogFile
         {
             get { return m_logFile; }
@@ -108,6 +109,8 @@ namespace PerfView
             Command cmd = null;
             try
             {
+                DotNetVersionLogger.Start();
+
                 Start(parsedArgs);
                 Thread.Sleep(100);          // Allow time for the start rundown events OS events to happen.  
                 DateTime startTime = DateTime.Now;
@@ -152,6 +155,7 @@ namespace PerfView
             }
             finally
             {
+                DotNetVersionLogger.Stop();
                 if (!success)
                 {
                     if (cmd != null)
@@ -172,7 +176,7 @@ namespace PerfView
             if (parsedArgs.CircularMB == 0)
             {
                 LogFile.WriteLine("Circular buffer size = 0, setting to 500.");
-                parsedArgs.CircularMB = 500;
+                parsedArgs.CircularMB = 4000;
             }
 
             for (int collectionNum = 1; ;)
@@ -204,6 +208,7 @@ namespace PerfView
                     }
                     else
                     {
+                        DotNetVersionLogger.Start();
                         Start(parsedArgs);
                         WaitUntilCollectionDone(collectionCompleted, parsedArgs, DateTime.Now);
                         if (m_aborted)
@@ -217,6 +222,7 @@ namespace PerfView
                 }
                 finally
                 {
+                    DotNetVersionLogger.Stop();
                     collectionCompleted.Set();  // This ensures that the GUI window closes.  
                     if (!success)
                     {
@@ -479,6 +485,8 @@ namespace PerfView
 
                     kernelModeSession.BufferSizeMB = parsedArgs.BufferSizeMB;
                     kernelModeSession.StackCompression = parsedArgs.StackCompression;
+                    kernelModeSession.LastBranchRecordingProfileSources = parsedArgs.LastBranchRecordingSources?.Parsed;
+                    kernelModeSession.LastBranchRecordingFilters = parsedArgs.LastBranchRecordingFilters?.Parsed ?? LbrFilterFlags.None;
                     kernelModeSession.CpuSampleIntervalMSec = parsedArgs.CpuSampleMSec;
                     if (parsedArgs.CircularMB != 0)
                     {
@@ -925,6 +933,11 @@ namespace PerfView
                             parsedArgs.ClrEventLevel, (ulong)parsedArgs.ClrEvents, options);
                     }
 
+                    if (parsedArgs.UserCritContention)
+                    {
+                        EnableUserProvider(userModeSession, "Microsoft-Windows-Win32k", new Guid("8C416C79-D49B-4F01-A467-E56D3AA8234C"), TraceEventLevel.Verbose, 0x10000000, options);
+                    }
+
                     // Start network monitoring capture if needed
                     if (parsedArgs.NetMonCapture)
                     {
@@ -1003,7 +1016,7 @@ namespace PerfView
                         heapSession.StopOnDispose = false;
                     }
 
-                    PerfViewLogger.Log.CommandLineParameters(ParsedArgsAsString(null, parsedArgs), Environment.CurrentDirectory, AppLog.VersionNumber);
+                    PerfViewLogger.Log.CommandLineParameters(ParsedArgsAsString(null, parsedArgs), Environment.CurrentDirectory, AppInfo.VersionNumber);
                 }
             }
         }
@@ -1162,188 +1175,197 @@ namespace PerfView
 
         public void Stop(CommandLineArgs parsedArgs)
         {
-            if (parsedArgs.DataFile == null)
-            {
-                parsedArgs.DataFile = "PerfViewData.etl";
-            }
-
-            // The DataFile does not have the .zip associated with it (it is implied)
-            if (parsedArgs.DataFile.EndsWith(".etl.zip", StringComparison.OrdinalIgnoreCase))
-            {
-                parsedArgs.DataFile = parsedArgs.DataFile.Substring(0, parsedArgs.DataFile.Length - 4);
-            }
-
-            LaunchPerfViewElevatedIfNeeded("Stop", parsedArgs);
-
-            if (parsedArgs.DumpHeap)
-            {
-                // Take a heap snapshot.
-                GuiHeapSnapshot(parsedArgs, true);
-
-                // Ensure that we clean up the heap snapshot state.
-                parsedArgs.DumpHeap = false;
-
-            }
-
-            LogFile.WriteLine("Stopping tracing for sessions '" + s_KernelessionName +
-                "' and '" + s_UserModeSessionName + "'.");
-
-            PerfViewLogger.Log.CommandLineParameters(ParsedArgsAsString(null, parsedArgs), Environment.CurrentDirectory, AppLog.VersionNumber);
-            PerfViewLogger.Log.StopTracing();
-            PerfViewLogger.StopTime = DateTime.UtcNow;
-            PerfViewLogger.Log.StartAndStopTimes();
-
-            // Also log the CPU Counters mapping.
-            var osVersion = Environment.OSVersion.Version.Major + Environment.OSVersion.Version.Minor / 10.0;
-            if (6.2 <= osVersion)        // CPU Counters only supported on Windows 8 and above
-            {
-                var cpuCounters = TraceEventProfileSources.GetInfo();
-                foreach (var cpuCounter in cpuCounters.Values)
+            try{
+                StopInProgress = true;
+                if (parsedArgs.DataFile == null)
                 {
-                    if (string.CompareOrdinal(cpuCounter.Name, "Timer") == 0)
-                    {
-                        continue;
-                    }
-
-                    PerfViewLogger.Log.CpuCounterIntervalSetting(cpuCounter.Name, cpuCounter.Interval, cpuCounter.ID);
-                    // LogFile.WriteLine("Cpu Counter Config {0} ID {1} Interval {2}", cpuCounter.Name, cpuCounter.Interval, cpuCounter.ID);
+                    parsedArgs.DataFile = "PerfViewData.etl";
                 }
-            }
 
-            // Try to stop the kernel session
-
-            Task stopKernel = Task.Factory.StartNew(delegate ()
-            {
-                try
+                // The DataFile does not have the .zip associated with it (it is implied)
+                if (parsedArgs.DataFile.EndsWith(".etl.zip", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (parsedArgs.KernelEvents != KernelTraceEventParser.Keywords.None)
+                    parsedArgs.DataFile = parsedArgs.DataFile.Substring(0, parsedArgs.DataFile.Length - 4);
+                }
+
+                LaunchPerfViewElevatedIfNeeded("Stop", parsedArgs);
+
+                if (parsedArgs.DumpHeap)
+                {
+                    // Take a heap snapshot.
+                    GuiHeapSnapshot(parsedArgs, true);
+
+                    // Ensure that we clean up the heap snapshot state.
+                    parsedArgs.DumpHeap = false;
+
+                }
+
+                LogFile.WriteLine("Stopping tracing for sessions '" + s_KernelessionName +
+                    "' and '" + s_UserModeSessionName + "'.");
+
+                PerfViewLogger.Log.CommandLineParameters(ParsedArgsAsString(null, parsedArgs), Environment.CurrentDirectory, AppInfo.VersionNumber);
+                PerfViewLogger.Log.StopTracing();
+                PerfViewLogger.StopTime = DateTime.UtcNow;
+                PerfViewLogger.Log.StartAndStopTimes();
+
+                // Also log the CPU Counters mapping.
+                var osVersion = Environment.OSVersion.Version.Major + Environment.OSVersion.Version.Minor / 10.0;
+                if (6.2 <= osVersion)        // CPU Counters only supported on Windows 8 and above
+                {
+                    var cpuCounters = TraceEventProfileSources.GetInfo();
+                    foreach (var cpuCounter in cpuCounters.Values)
                     {
-                        using (var kernelSession = new TraceEventSession(s_KernelessionName, TraceEventSessionOptions.Attach))
+                        if (string.CompareOrdinal(cpuCounter.Name, "Timer") == 0)
+                        {
+                            continue;
+                        }
+
+                        PerfViewLogger.Log.CpuCounterIntervalSetting(cpuCounter.Name, cpuCounter.Interval, cpuCounter.ID);
+                        // LogFile.WriteLine("Cpu Counter Config {0} ID {1} Interval {2}", cpuCounter.Name, cpuCounter.Interval, cpuCounter.ID);
+                    }
+                }
+
+                // Try to stop the kernel session
+
+                Task stopKernel = Task.Factory.StartNew(delegate ()
+                {
+                    try
+                    {
+                        if (parsedArgs.KernelEvents != KernelTraceEventParser.Keywords.None)
+                        {
+                            using (var kernelSession = new TraceEventSession(s_KernelessionName, TraceEventSessionOptions.Attach))
+                            {
+                                if (parsedArgs.InMemoryCircularBuffer)
+                                {
+                                    LogFile.WriteLine("InMemoryCircularBuffer Set, Dumping kernel log");
+                                    kernelSession.SetFileName(Path.ChangeExtension(parsedArgs.DataFile, ".kernel.etl")); // Flush the file 
+
+
+                                    LogFile.WriteLine("InMemoryCircularBuffer Set, Doing Kernel Rundown");
+                                    // We need to manually do a kernel rundown to get the list of running processes and images loaded into memory
+                                    // Ideally this is done by the SetFileName API so we can avoid merging.  
+                                    var rundownFile = Path.ChangeExtension(parsedArgs.DataFile, ".kernelRundown.etl");
+
+                                    // Note that enabling providers is async, and thus there is a concern that we would lose events if we don't wait 
+                                    // until the events are logged before shutting down the session.   However we only need the DCEnd events and
+                                    // those are PART of kernel session stop, which is synchronous (the session will not die until it is complete)
+                                    // so we don't have to wait after enabling the kernel session.    It is somewhat unfortunate that we have both
+                                    // the DCStart and the DCStop events, but there does not seem to be a way of asking for just one set.  
+                                    using (var kernelRundownSession = new TraceEventSession(s_UserModeSessionName + "KernelRundown", rundownFile))
+                                    {
+                                        kernelRundownSession.BufferSizeMB = 256;    // Try to avoid lost events.  
+                                        kernelRundownSession.EnableKernelProvider(KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.ImageLoad);
+                                    }
+                                    LogFile.WriteLine("InMemoryCircularBuffer Set, Finished Kernel Rundown");
+                                }
+                                kernelSession.Stop();
+                            }
+                        }
+                    }
+                    catch (FileNotFoundException) { LogFile.WriteLine("No Kernel events were active for this trace."); }
+                    catch (Exception e) { if (!(e is ThreadInterruptedException)) { LogFile.WriteLine("Error stopping Kernel session: " + e.Message); } throw; }
+                });
+
+                string dataFile = null;
+                Task stopUser = Task.Factory.StartNew(delegate ()
+                {
+                    try
+                    {
+                        using (TraceEventSession clrSession = new TraceEventSession(s_UserModeSessionName, TraceEventSessionOptions.Attach))
                         {
                             if (parsedArgs.InMemoryCircularBuffer)
                             {
                                 LogFile.WriteLine("InMemoryCircularBuffer Set, Dumping kernel log");
-                                kernelSession.SetFileName(Path.ChangeExtension(parsedArgs.DataFile, ".kernel.etl")); // Flush the file 
-
-
-                                LogFile.WriteLine("InMemoryCircularBuffer Set, Doing Kernel Rundown");
-                                // We need to manually do a kernel rundown to get the list of running processes and images loaded into memory
-                                // Ideally this is done by the SetFileName API so we can avoid merging.  
-                                var rundownFile = Path.ChangeExtension(parsedArgs.DataFile, ".kernelRundown.etl");
-
-                                // Note that enabling providers is async, and thus there is a concern that we would lose events if we don't wait 
-                                // until the events are logged before shutting down the session.   However we only need the DCEnd events and
-                                // those are PART of kernel session stop, which is synchronous (the session will not die until it is complete)
-                                // so we don't have to wait after enabling the kernel session.    It is somewhat unfortunate that we have both
-                                // the DCStart and the DCStop events, but there does not seem to be a way of asking for just one set.  
-                                using (var kernelRundownSession = new TraceEventSession(s_UserModeSessionName + "KernelRundown", rundownFile))
-                                {
-                                    kernelRundownSession.BufferSizeMB = 256;    // Try to avoid lost events.  
-                                    kernelRundownSession.EnableKernelProvider(KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.ImageLoad);
-                                }
-                                LogFile.WriteLine("InMemoryCircularBuffer Set, Finished Kernel Rundown");
+                                dataFile = parsedArgs.DataFile;
+                                clrSession.SetFileName(dataFile);   // Flush the file 
                             }
-                            kernelSession.Stop();
+                            else
+                            {
+                                dataFile = clrSession.FileName;
+                            }
+
+                            clrSession.Stop();
                         }
                     }
-                }
-                catch (FileNotFoundException) { LogFile.WriteLine("No Kernel events were active for this trace."); }
-                catch (Exception e) { if (!(e is ThreadInterruptedException)) { LogFile.WriteLine("Error stopping Kernel session: " + e.Message); } throw; }
-            });
+                    catch (Exception e) { if (!(e is ThreadInterruptedException)) { LogFile.WriteLine("Error stopping User session: " + e.Message); } throw; }
+                });
 
-            string dataFile = null;
-            Task stopUser = Task.Factory.StartNew(delegate ()
-            {
-                try
+                Task stopHeap = Task.Factory.StartNew(delegate ()
                 {
-                    using (TraceEventSession clrSession = new TraceEventSession(s_UserModeSessionName, TraceEventSessionOptions.Attach))
+                    try
                     {
-                        if (parsedArgs.InMemoryCircularBuffer)
+                        using (var heapSession = new TraceEventSession(s_HeapSessionName, TraceEventSessionOptions.Attach))
                         {
-                            LogFile.WriteLine("InMemoryCircularBuffer Set, Dumping kernel log");
-                            dataFile = parsedArgs.DataFile;
-                            clrSession.SetFileName(dataFile);   // Flush the file 
+                            heapSession.Stop();
                         }
-                        else
-                        {
-                            dataFile = clrSession.FileName;
-                        }
-
-                        clrSession.Stop();
                     }
-                }
-                catch (Exception e) { if (!(e is ThreadInterruptedException)) { LogFile.WriteLine("Error stopping User session: " + e.Message); } throw; }
-            });
+                    catch (FileNotFoundException) { LogFile.WriteLine("No Heap events were active for this trace."); }
+                    catch (Exception e) { if (!(e is ThreadInterruptedException)) { LogFile.WriteLine("Error stopping Heap session: " + e.Message); } throw; }
+                });
 
-            Task stopHeap = Task.Factory.StartNew(delegate ()
-            {
-                try
+                // We stop the two sessions concurrently because we have notice that sometime the kernel session 
+                // Takes a while to shutdown, and we want the user mode session to shutdown at basically the same time
+                // Doing them concurrently minimizes any skew.  
+                Task.WaitAll(stopKernel, stopUser, stopHeap);
+
+                // Try to force the rundown of CLR method and loader events.  This routine does not fail.  
+                DoClrRundownForSession(dataFile, s_UserModeSessionName, parsedArgs);
+
+                LogFile.WriteLine("Done stopping sessions.");
+
+                UninstallETWClrProfiler(LogFile);
+
+                if (dataFile == null || !File.Exists(dataFile))
                 {
-                    using (var heapSession = new TraceEventSession(s_HeapSessionName, TraceEventSessionOptions.Attach))
+                    LogFile.WriteLine("Warning: no data generated. (Separate Start and Stop does not work with /InMemoryCircularBuffer)\n");
+                }
+                else
+                {
+                    parsedArgs.DataFile = dataFile;
+                    if (parsedArgs.ShouldMerge)
                     {
-                        heapSession.Stop();
+                        Merge(parsedArgs);
                     }
                 }
-                catch (FileNotFoundException) { LogFile.WriteLine("No Heap events were active for this trace."); }
-                catch (Exception e) { if (!(e is ThreadInterruptedException)) { LogFile.WriteLine("Error stopping Heap session: " + e.Message); } throw; }
-            });
+                CollectingData = false;
 
-            // We stop the two sessions concurrently because we have notice that sometime the kernel session 
-            // Takes a while to shutdown, and we want the user mode session to shutdown at basically the same time
-            // Doing them concurrently minimizes any skew.  
-            Task.WaitAll(stopKernel, stopUser, stopHeap);
-            
-            // Try to force the rundown of CLR method and loader events.  This routine does not fail.  
-            DoClrRundownForSession(dataFile, s_UserModeSessionName, parsedArgs);
-            
-            LogFile.WriteLine("Done stopping sessions.");
-
-            UninstallETWClrProfiler(LogFile);
-
-            if (dataFile == null || !File.Exists(dataFile))
-            {
-                LogFile.WriteLine("Warning: no data generated. (Separate Start and Stop does not work with /InMemoryCircularBuffer)\n");
-            }
-            else
-            {
-                parsedArgs.DataFile = dataFile;
-                if (parsedArgs.ShouldMerge)
+                if (App.CommandLineArgs.StopCommand != null)        // it is a bit of a hack to use the global variable. 
                 {
-                    Merge(parsedArgs);
-                }
-            }
-            CollectingData = false;
+                    var commandToRun = App.CommandLineArgs.StopCommand;
+                    commandToRun = commandToRun.Replace("%OUTPUTDIR%", Path.GetDirectoryName(App.CommandLineArgs.DataFile));
+                    commandToRun = commandToRun.Replace("%OUTPUTBASENAME%", Path.GetFileNameWithoutExtension(App.CommandLineArgs.DataFile));
 
-            if (App.CommandLineArgs.StopCommand != null)        // it is a bit of a hack to use the global variable. 
-            {
-                var commandToRun = App.CommandLineArgs.StopCommand;
-                commandToRun = commandToRun.Replace("%OUTPUTDIR%", Path.GetDirectoryName(App.CommandLineArgs.DataFile));
-                commandToRun = commandToRun.Replace("%OUTPUTBASENAME%", Path.GetFileNameWithoutExtension(App.CommandLineArgs.DataFile));
+                    LogFile.WriteLine("Executing /StopCommand: {0}", commandToRun);
 
-                LogFile.WriteLine("Executing /StopCommand: {0}", commandToRun);
+                    // We are in the wow, so run this in 64 bit if we need 
+                    var cmdExe = Path.Combine(Environment.GetEnvironmentVariable("SystemRoot"), "SysNative", "Cmd.exe");
+                    if (!File.Exists(cmdExe))
+                    {
+                        cmdExe = cmdExe.Replace("SysNative", "System32");
+                    }
 
-                // We are in the wow, so run this in 64 bit if we need 
-                var cmdExe = Path.Combine(Environment.GetEnvironmentVariable("SystemRoot"), "SysNative", "Cmd.exe");
-                if (!File.Exists(cmdExe))
-                {
-                    cmdExe = cmdExe.Replace("SysNative", "System32");
+                    commandToRun = cmdExe + " /c " + commandToRun;
+                    var cmd = Command.Run(commandToRun, new CommandOptions().AddOutputStream(LogFile).AddNoThrow().AddTimeout(60000));
+                    if (cmd.ExitCode != 0)
+                    {
+                        LogFile.WriteLine("Error: On Stop command return error code {0}", cmd.ExitCode);
+                    }
+
+                    LogFile.WriteLine("/StopCommand complete {0}", commandToRun);
                 }
 
-                commandToRun = cmdExe + " /c " + commandToRun;
-                var cmd = Command.Run(commandToRun, new CommandOptions().AddOutputStream(LogFile).AddNoThrow().AddTimeout(60000));
-                if (cmd.ExitCode != 0)
-                {
-                    LogFile.WriteLine("Error: On Stop command return error code {0}", cmd.ExitCode);
-                }
+                // We put this last because it can take a while.  
+                DisableNetMonTrace();
 
-                LogFile.WriteLine("/StopCommand complete {0}", commandToRun);
+                DateTime stopComplete = DateTime.Now;
+                LogFile.WriteLine("Stop Completed at {0}", stopComplete);
             }
 
-            // We put this last because it can take a while.  
-            DisableNetMonTrace();
-
-            DateTime stopComplete = DateTime.Now;
-            LogFile.WriteLine("Stop Completed at {0}", stopComplete);
+            finally
+            {
+                // Ensure that the value of StopInProgress doesn't become stale
+                StopInProgress = false;
+            }
         }
         public void Mark(CommandLineArgs parsedArgs)
         {
@@ -1448,6 +1470,9 @@ namespace PerfView
                     DisableNetMonTrace();
                 }
                 catch (Exception) { }
+
+                // Ensure that DotNetVersionLogger is disabled.
+                DotNetVersionLogger.Abort();
             }
         }
 
@@ -1855,11 +1880,11 @@ namespace PerfView
         public void GuiHeapSnapshot(CommandLineArgs parsedArgs, bool waitForCompletion)
         {
 #if !PERFVIEW_COLLECT
-            // We'll wait on this handle until the heap snapshot completes.
-            ManualResetEvent waitHandle = new ManualResetEvent(false);
-
             if (GuiApp.MainWindow != null)
             {
+                // We'll wait on this handle until the heap snapshot completes.
+                ManualResetEvent waitHandle = new ManualResetEvent(false);
+
                 GuiApp.MainWindow.Dispatcher.BeginInvoke((Action)delegate ()
                 {
                     GuiApp.MainWindow.TakeHeapShapshot((Action)delegate ()
@@ -1869,11 +1894,15 @@ namespace PerfView
                         waitHandle.Set();
                     });
                 });
-            }
 
-            if (waitForCompletion)
+                if (waitForCompletion)
+                {
+                    waitHandle.WaitOne();
+                }
+            }
+            else
             {
-                waitHandle.WaitOne();
+                LogFile.WriteLine("[WARNING: Unable to capture the requested heap snapshot via command line.  Please re-run without /NoGui.]");
             }
 #endif
         }
@@ -2787,6 +2816,16 @@ namespace PerfView
                 cmdLineArgs += " /StackCompression";
             }
 
+            if (parsedArgs.LastBranchRecordingSources != null)
+            {
+                cmdLineArgs += " " + Command.Quote("/LbrSources:" + parsedArgs.LastBranchRecordingSources.Text);
+            }
+
+            if (parsedArgs.LastBranchRecordingFilters != null)
+            {
+                cmdLineArgs += " " + Command.Quote("/LbrFilters:" + parsedArgs.LastBranchRecordingFilters.Text);
+            }
+
             if (parsedArgs.CircularMB != 0)
             {
                 cmdLineArgs += " /CircularMB:" + parsedArgs.CircularMB;
@@ -2810,6 +2849,11 @@ namespace PerfView
             if (parsedArgs.RundownTimeout != 120)
             {
                 cmdLineArgs += " /RundownTimeout:" + parsedArgs.RundownTimeout;
+            }
+
+            if (parsedArgs.RundownMaxMB != -1)
+            {
+                cmdLineArgs += " /RundownMaxMB:" + parsedArgs.RundownMaxMB;
             }
 
             if (parsedArgs.CpuCounters != null)
@@ -2955,6 +2999,11 @@ namespace PerfView
             if (parsedArgs.ShowOptimizationTiers)
             {
                 cmdLineArgs += " /ShowOptimizationTiers";
+            }
+
+            if (parsedArgs.DisableDotNetVersionLogging)
+            {
+                cmdLineArgs += " /DisableDotNetVersionLogging";
             }
 
             if (parsedArgs.ContinueOnError)
@@ -3122,7 +3171,7 @@ namespace PerfView
                 cmdLineArgs += " /DumpData";
             }
 
-            if (parsedArgs.MaxDumpCountK != 250)
+            if (parsedArgs.MaxDumpCountK != 0)
             {
                 cmdLineArgs += " /MaxDumpCountK=" + parsedArgs.MaxDumpCountK;
             }
@@ -3140,6 +3189,11 @@ namespace PerfView
             if (parsedArgs.RuntimeLoading)
             {
                 cmdLineArgs += " /RuntimeLoading";
+            }
+
+            if (parsedArgs.UserCritContention)
+            {
+                cmdLineArgs += " /UserCritContention";
             }
 
             if(parsedArgs.ImageIDsOnly)
@@ -3219,7 +3273,7 @@ namespace PerfView
                 wildCardFileName = Command.FindOnPath(GetExeName(commandLine));
             }
 
-            var parsedProviders = ProviderParser.ParseProviderSpecs(providerSpecs, wildCardFileName, LogFile);
+            var parsedProviders = ProviderParser.ParseProviderSpecs(providerSpecs, wildCardFileName, options, LogFile);
             foreach (var parsedProvider in parsedProviders)
             {
                 if (parsedProvider.Level == TraceEventLevel.Always && parsedProvider.MatchAnyKeywords == 0)
@@ -3410,15 +3464,18 @@ namespace PerfView
                 LogFile.WriteLine("[Use /NoNGenRundown if you don't care about pre V4.0 runtimes]");
             }
 
-            Stopwatch sw = Stopwatch.StartNew();
-            TraceEventSession clrRundownSession = null;
             try
             {
-                try
+                Stopwatch sw = Stopwatch.StartNew();
+                if (!DotNetVersionLogger.Running)
                 {
-                    var rundownFile = Path.ChangeExtension(fileName, ".clrRundown.etl");
-                    clrRundownSession = new TraceEventSession(sessionName + "Rundown", rundownFile);
+                    DotNetVersionLogger.Start();
+                }
 
+                DotNetVersionLogger.StartRundown();
+                var rundownFile = Path.ChangeExtension(fileName, ".clrRundown.etl");
+                using (TraceEventSession clrRundownSession = new TraceEventSession(sessionName + "Rundown", rundownFile))
+                {
                     clrRundownSession.BufferSizeMB = Math.Max(parsedArgs.BufferSizeMB, 256);
 
                     TraceEventProviderOptions options = null;
@@ -3468,7 +3525,7 @@ namespace PerfView
                     {
                         if (parsedArgs.Providers != null)
                         {
-                            var parsedProviders = ProviderParser.ParseProviderSpecs(parsedArgs.Providers, null, LogFile);
+                            var parsedProviders = ProviderParser.ParseProviderSpecs(parsedArgs.Providers, null, null, LogFile);
                             foreach (var parsedProvider in parsedProviders)
                             {
                                 // turn it on in the Rundown Session, this will dump the manifest into the rundown information. 
@@ -3488,12 +3545,17 @@ namespace PerfView
                     if (parsedArgs.ClrEvents != ClrTraceEventParser.Keywords.None)
                     {
                         // Always enable minimal rundown, which ensures that we get the runtime start event.
-                        // We use the keyword 0x800000000000 which does not match any valid keyword in the rundown provider.
-                        // Choosing 0 results in enabling all keywords based on the logic that checks for keyword status in the runtime.
-                        // NOTE: This used to be 0x40000000 which matched the ClrStack keyword in the main provider.  This resulted in
-                        // lots of ClrStack/Walk events that couldn't be matched with Clr events, because for V2 rundown, we enable
-                        // the Clr provider.
-                        var rundownKeywords = (ClrRundownTraceEventParser.Keywords)0x800000000000;
+                        // .NET Core requires that StartEnumeration or ForceEndRundown is specified in order
+                        // to get the runtime start event.  For minimal rundown, just enabling ForceEndRundown
+                        // should be enough to get the rundown event for both .NET Framework and .NET Core
+                        // without going down any expensive rundown codepaths.
+
+                        // Minimal rundown includes:
+                        // - Runtime/Start event
+                        // - TieredCompilation
+                        var rundownKeywords = ClrRundownTraceEventParser.Keywords.ForceEndRundown |
+                            ClrRundownTraceEventParser.Keywords.Compilation |
+                            ClrRundownTraceEventParser.Keywords.GC;
 
                         // Only consider forcing suppression of these keywords if full rundown is enabled.
                         if (!parsedArgs.NoRundown && !parsedArgs.NoClrRundown)
@@ -3545,26 +3607,17 @@ namespace PerfView
                     PerfViewLogger.Log.WaitForIdle();
 
                     // Wait for rundown to complete.
-                    WaitForRundownIdle(parsedArgs.MinRundownTime, parsedArgs.RundownTimeout, rundownFile);
+                    WaitForRundownIdle(parsedArgs.MinRundownTime, parsedArgs.RundownTimeout, parsedArgs.RundownMaxMB, rundownFile);
 
                     // Complete perfview rundown.
-                    PerfViewLogger.Log.CommandLineParameters(ParsedArgsAsString(null, parsedArgs), Environment.CurrentDirectory, AppLog.VersionNumber);
+                    DotNetVersionLogger.Stop();
+                    PerfViewLogger.Log.CommandLineParameters(ParsedArgsAsString(null, parsedArgs), Environment.CurrentDirectory, AppInfo.VersionNumber);
                     PerfViewLogger.Log.StartAndStopTimes();
                     PerfViewLogger.Log.StopRundown();
+                }
 
-                    // Disable the rundown provider.
-                    clrRundownSession.Stop();
-                    clrRundownSession = null;
-                    sw.Stop();
-                    LogFile.WriteLine("CLR Rundown took {0:f3} sec.", sw.Elapsed.TotalSeconds);
-                }
-                finally
-                {
-                    if (clrRundownSession != null)
-                    {
-                        clrRundownSession.Stop();
-                    }
-                }
+                sw.Stop();
+                LogFile.WriteLine("CLR Rundown took {0:f3} sec.", sw.Elapsed.TotalSeconds);
             }
             catch (Exception e)
             {
@@ -3580,9 +3633,10 @@ namespace PerfView
         /// Currently there is no good way to know when rundown is finished.  We basically wait as long as
         /// the rundown file is growing.  
         /// </summary>
-        private void WaitForRundownIdle(int minSeconds, int maxSeconds, string rundownFilePath)
+        private void WaitForRundownIdle(int minSeconds, int maxSeconds, int maxSizeMB, string rundownFilePath)
         {
             LogFile.WriteLine("Waiting up to {0} sec for rundown events.  Use /RundownTimeout to change.", maxSeconds);
+            LogFile.WriteLine($"Maximum rundown file size is {maxSizeMB}MB.  Use /RundownMaxMB to change.");
             LogFile.WriteLine("If you know your process has exited, use /noRundown qualifer to skip this step.");
 
             long rundownFileLen = 0;
@@ -3598,6 +3652,12 @@ namespace PerfView
                 var delta = newRundownFileLen - rundownFileLen;
                 LogFile.WriteLine("Rundown File Length: {0:n1}MB delta: {1:n1}MB", newRundownFileLen / 1000000.0, delta / 1000000.0);
                 rundownFileLen = newRundownFileLen;
+
+                if ((maxSizeMB > 0) && rundownFileLen >= (maxSizeMB * 1024 * 1024))
+                {
+                    LogFile.WriteLine($"Exceeded maximum rundown file size of {maxSizeMB}MB.");
+                    break;
+                }
 
                 if (i >= minSeconds)
                 {
@@ -3639,7 +3699,7 @@ namespace PerfView
         /// <summary>
         /// TODO FIX NOW document
         /// </summary>
-        public static List<ParsedProvider> ParseProviderSpecs(string[] providerSpecs, string wildCardFileName, TextWriter log = null)
+        public static List<ParsedProvider> ParseProviderSpecs(string[] providerSpecs, string wildCardFileName, TraceEventProviderOptions inputOptions, TextWriter log = null)
         {
             var ret = new List<ParsedProvider>();
 
@@ -3650,7 +3710,7 @@ namespace PerfView
                     log.WriteLine("Parsing ETW Provider Spec: {0}", providerSpec);
                 }
 
-                TraceEventProviderOptions options = new TraceEventProviderOptions();
+                TraceEventProviderOptions options = inputOptions?.Clone() ?? new TraceEventProviderOptions();
                 TraceEventLevel level = TraceEventLevel.Verbose;
                 ulong matchAnyKeywords = unchecked((ulong)-1);
 
@@ -4037,6 +4097,7 @@ namespace PerfView
 
         #region private
 
+#if !NET
         private static void GetStaticReferencedAssemblies(Assembly assembly, Dictionary<Assembly, Assembly> soFar)
         {
             soFar[assembly] = assembly;
@@ -4068,6 +4129,8 @@ namespace PerfView
                 }
             }
         }
+#endif
+
         #endregion
     }
 }

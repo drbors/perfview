@@ -117,6 +117,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             Directory.CreateDirectory(directoryPath);
             foreach (var providerManifest in DynamicProviders)
             {
+                
                 var filePath = Path.Combine(directoryPath, providerManifest.Name + ".manifest.xml");
                 providerManifest.WriteToFile(filePath);
             }
@@ -194,6 +195,14 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 
             // We also are expecting only these tasks and opcodes.  
             if (data.Opcode != (TraceEventOpcode)0xFE || data.Task != (TraceEventTask)0xFFFE)
+            {
+                return false;
+            }
+
+            // Starting with .NET 6, the manifest is written into the event stream, which results in
+            // duplicate event dispatch.  To avoid this, filter out the Microsoft-Windows-DotNETRuntime provider
+            // if it is present in the event stream.
+            if (data.ProviderGuid == ClrTraceEventParser.ProviderGuid)
             {
                 return false;
             }
@@ -316,8 +325,8 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                     goto Fail;
                 }
 
-                ushort totalChunks = (ushort)data.GetInt16At(4);
-                ushort chunkNum = (ushort)data.GetInt16At(6);
+                ushort totalChunks = data.GetUInt16At(4);
+                ushort chunkNum = data.GetUInt16At(6);
                 if (chunkNum >= totalChunks || totalChunks == 0)
                 {
                     goto Fail;
@@ -332,8 +341,8 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                     }
 
                     format = (ManifestEnvelope.ManifestFormats)data.GetByteAt(0);
-                    majorVersion = (byte)data.GetByteAt(1);
-                    minorVersion = (byte)data.GetByteAt(2);
+                    majorVersion = data.GetByteAt(1);
+                    minorVersion = data.GetByteAt(2);
                     ChunksLeft = totalChunks;
                     Chunks = new byte[ChunksLeft][];
                 }
@@ -690,7 +699,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                                 }
                                 else
                                 {
-                                    size = (ushort)GetInt16At(offset);
+                                    size = GetUInt16At(offset);
                                     offset += 2;        // skip size;
                                 }
                                 if (unicodeByteCountString)
@@ -720,23 +729,23 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 case TypeCode.Boolean:
                     return GetByteAt(offset) != 0;
                 case TypeCode.Char:
-                    return (Char)GetInt16At(offset);
+                    return (Char)GetUInt16At(offset);
                 case TypeCode.Byte:
                     return (byte)GetByteAt(offset);
                 case TypeCode.SByte:
-                    return (SByte)GetByteAt(offset);
+                    return (SByte)GetSByteAt(offset);
                 case TypeCode.Int16:
                     return GetInt16At(offset);
                 case TypeCode.UInt16:
-                    return (UInt16)GetInt16At(offset);
+                    return (UInt16)GetUInt16At(offset);
                 case TypeCode.Int32:
                     return GetInt32At(offset);
                 case TypeCode.UInt32:
-                    return (UInt32)GetInt32At(offset);
+                    return (UInt32)GetUInt32At(offset);
                 case TypeCode.Int64:
                     return GetInt64At(offset);
                 case TypeCode.UInt64:
-                    return (UInt64)GetInt64At(offset);
+                    return (UInt64)GetUInt64At(offset);
                 case TypeCode.Single:
                     return GetSingleAt(offset);
                 case TypeCode.Double:
@@ -746,11 +755,11 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                     {
                         if (PointerSize == 4)
                         {
-                            return (Address)GetInt32At(offset);
+                            return (Address)GetUInt32At(offset);
                         }
                         else
                         {
-                            return (Address)GetInt64At(offset);
+                            return (Address)GetUInt64At(offset);
                         }
                     }
                     else if (type == typeof(Guid))
@@ -847,7 +856,9 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                             first = false;
                         }
 
-                        sb.Append(keyvalue.Key).Append(":");
+                        sb.Append("\"");
+                        Quote(sb, keyvalue.Key);
+                        sb.Append("\":");
                         WriteAsJSon(sb, keyvalue.Value);
                     }
                     sb.Append(" }");
@@ -1588,8 +1599,8 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             }
             public void ToStream(Serializer serializer)
             {
-                serializer.Write((short)Offset);
-                serializer.Write((short)Size);
+                serializer.Write(Offset);
+                serializer.Write(Size);
                 if (Type == null)
                 {
                     serializer.Write((string)null);
@@ -1650,8 +1661,8 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             }
             public void FromStream(Deserializer deserializer)
             {
-                Offset = (ushort)deserializer.ReadInt16();
-                Size = (ushort)deserializer.ReadInt16();
+                Offset = deserializer.ReadUInt16();
+                Size = deserializer.ReadUInt16();
                 var typeName = deserializer.ReadString();
                 if (typeName != null)
                 {
@@ -1777,15 +1788,14 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
             deserializer.Read(out lookupAsClassic);
             deserializer.Read(out lookupAsWPP);
             deserializer.Read(out containsSelfDescribingMetadata);
-            int count;
-            deserializer.Read(out count);
+            int count = deserializer.ReadInt();
             payloadNames = new string[count];
             for (int i = 0; i < count; i++)
             {
                 deserializer.Read(out payloadNames[i]);
             }
 
-            deserializer.Read(out count);
+            count = deserializer.ReadInt();
             payloadFetches = new PayloadFetch[count];
             for (int i = 0; i < count; i++)
             {
@@ -1900,8 +1910,7 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
 
         void IFastSerializable.FromStream(Deserializer deserializer)
         {
-            int count;
-            deserializer.Read(out count);
+            int count = deserializer.ReadInt();
             for (int i = 0; i < count; i++)
             {
                 ProviderManifest provider;
@@ -2076,7 +2085,13 @@ namespace Microsoft.Diagnostics.Tracing.Parsers
                 settings.IgnoreComments = true;
                 settings.IgnoreWhitespace = true;
 
-                System.IO.MemoryStream stream = new System.IO.MemoryStream(serializedManifest);
+                // Workaround for corrupt manifest produced by
+                // https://github.com/dotnet/roslyn/commit/b7025ccf594d75c98b2aa50f0800fd5ef1135ccc prior to
+                // https://github.com/dotnet/roslyn/pull/52479.
+                var manifest = Manifest.Replace("<OnEventCommand>", "&lt;OnEventCommand&gt;");
+                var bytes = Encoding.UTF8.GetBytes(manifest);
+
+                System.IO.MemoryStream stream = new System.IO.MemoryStream(bytes);
                 return XmlReader.Create(stream, settings);
             }
         }

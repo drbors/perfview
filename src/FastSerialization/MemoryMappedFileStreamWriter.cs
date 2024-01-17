@@ -4,14 +4,14 @@
 // This program uses code hyperlinks available as part of the HyperAddin Visual Studio plug-in.
 // It is available from http://www.codeplex.com/hyperAddin 
 // 
-#if false  // This code is currently unused, commented out.  
+
 using System;
+using System.Diagnostics;
 using System.Text;      // For StringBuilder.
 using System.Threading;
 using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
-using DeferedStreamLabel = FastSerialization.StreamLabel;
 
 #if !NETSTANDARD1_3
 using System.Runtime.CompilerServices;
@@ -27,6 +27,8 @@ namespace FastSerialization
         internal const long InitialCapacity = 64 * 1024;
         internal const int BlockCopyCapacity = 10 * 1024 * 1024;
 
+        private Action<StreamLabel> writeLabel;
+
         private MemoryMappedFile _file;
         private string _mapName;
         private long _fileCapacity;
@@ -36,8 +38,26 @@ namespace FastSerialization
         private int _capacity;
         private int _offset;
 
-        public MemoryMappedFileStreamWriter(long initialCapacity = InitialCapacity)
+        public MemoryMappedFileStreamWriter(long initialCapacity = InitialCapacity, SerializationConfiguration config = null)
         {
+            SerializationConfiguration = config ?? new SerializationConfiguration();
+
+            if (SerializationConfiguration.StreamLabelWidth == StreamLabelWidth.FourBytes)
+            {
+                writeLabel = (value) =>
+                {
+                    Debug.Assert((long)value <= int.MaxValue, "The StreamLabel overflowed, it should not be treated as a 32bit value.");
+                    Write((int)value);
+                };
+            }
+            else
+            {
+                writeLabel = (value) =>
+                {
+                    Write((long)value);
+                };
+            }
+
             long subPageSize = initialCapacity % PageSize;
             if (subPageSize != 0)
             {
@@ -58,6 +78,11 @@ namespace FastSerialization
                 throw new OutOfMemoryException(e.Message, e);
             }
         }
+
+        /// <summary>
+        /// Returns the SerializationConfiguration for this stream writer.
+        /// </summary>
+        internal SerializationConfiguration SerializationConfiguration { get; }
 
         public void Dispose()
         {
@@ -81,7 +106,7 @@ namespace FastSerialization
 
         public MemoryMappedFileStreamReader GetReader()
         {
-            return new MemoryMappedFileStreamReader(_mapName, Length);
+            return new MemoryMappedFileStreamReader(_mapName, Length, SerializationConfiguration);
         }
 
         public void Clear()
@@ -110,9 +135,9 @@ namespace FastSerialization
         public long Length
             => _viewOffset + _offset;
 
-        public DeferedStreamLabel GetLabel()
+        public StreamLabel GetLabel()
         {
-            return checked((DeferedStreamLabel)Length);
+            return checked((StreamLabel)Length);
         }
 
         public void Write(byte[] data, int offset, int length)
@@ -142,7 +167,7 @@ namespace FastSerialization
                 Resize(length);
             }
 
-#if NETSTANDARD1_3
+#if NETSTANDARD1_6
 
             for (int i = 0; i < length; i++)
             {
@@ -198,9 +223,9 @@ namespace FastSerialization
             _offset += sizeof(long);
         }
 
-        public void Write(DeferedStreamLabel value)
+        public void Write(StreamLabel value)
         {
-            Write((int)value);
+            writeLabel(value);
         }
 
         public unsafe void Write(string value)
@@ -217,7 +242,7 @@ namespace FastSerialization
                 {
                     byte* pointer = null;
 
-#if !NETSTANDARD1_3
+#if !NETSTANDARD1_6
                     RuntimeHelpers.PrepareConstrainedRegions();
 #endif
                     try
@@ -228,7 +253,7 @@ namespace FastSerialization
                         int charsUsed;
                         int bytesUsed;
                         bool completed;
-#if NETSTANDARD1_3
+#if NETSTANDARD1_6
                         char[] charArray = value.ToCharArray();
                         byte[] bytes = new byte[_capacity - _offset];
                         encoder.Convert(charArray, 0, charArray.Length, bytes, 0, bytes.Length, false, out charsUsed, out bytesUsed, out completed);
@@ -244,7 +269,7 @@ namespace FastSerialization
 
                             int finalCharsUsed;
                             int finalBytesUsed;
-#if NETSTANDARD1_3
+#if NETSTANDARD1_6
                             bytes = new byte[_capacity - _offset];
                             encoder.Convert(charArray, charsUsed, charArray.Length - charsUsed, bytes, 0, bytes.Length, true, out finalCharsUsed, out finalBytesUsed, out completed);
                             Marshal.Copy(bytes, 0, (IntPtr)(pointer + bytesUsed), finalBytesUsed);
@@ -264,7 +289,7 @@ namespace FastSerialization
             }
         }
 
-        public void WriteSuffixLabel(DeferedStreamLabel value)
+        public void WriteSuffixLabel(StreamLabel value)
         {
             // This is guaranteed to be uncompressed, but since we are not compressing anything, we can
             // simply write the value.  
@@ -353,4 +378,3 @@ namespace FastSerialization
         }
     }
 }
-#endif

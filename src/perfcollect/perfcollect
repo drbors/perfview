@@ -54,6 +54,7 @@
 collect_cpu=1
 collect_threadTime=0
 collect_offcpu=0
+collect_system=0
 
 ######################################
 ## .NET Event Categories
@@ -854,24 +855,36 @@ DiscoverCommands()
         $perfcmd --version > /dev/null 2>&1
         if [ "$?" == "1" ]
         then
-            perf49Cmd=`GetCommandFullPath "perf_4.9"`
-            $perf49Cmd --version > /dev/null 2>&1
-            if [ "$?" == "0" ]
+            perfoutput=$($perfcmd 2>&1)
+            if [ $? -eq 1 ]
             then
-                perfcmd=$perf49Cmd
-            else
-                perf419Cmd=`GetCommandFullPath "perf_4.19"`
-                $perf419Cmd --version > /dev/null 2>&1
-                if [ "$?" == "0" ]
+                perfMarker="perf_"
+                if [[ "$perfoutput" == *"$perfMarker"* ]]
                 then
-                    perfcmd=$perf419Cmd
-                else
-                    perf316Cmd=`GetCommandFullPath "perf_3.16"`
-                    $perf316Cmd --version > /dev/null 2>&1
-                    if [ "$?" == "0" ]
+                    foundWorkingPerf=0
+                    WriteWarning "Perf is installed, but does not exactly match the version of the running kernel."
+                    WriteWarning "This is often OK, and we'll try to workaround this."
+                    WriteStatus "Attempting to find a working copy of perf."
+                    # Attempt to find an existing version of perf to use.
+                    # Order the search by newest directory first.
+                    baseDir="/usr/bin"
+                    searchPath="$baseDir/perf_*"
+                    for fileName in $(ls -d --sort=time $searchPath)
+                    do
+                        $($fileName > /dev/null 2>&1)
+                        if [ $? -eq 1 ]
+                        then
+                            # If $? == 1, then use this copy of perf.
+                            perfcmd=$fileName
+                            foundWorkingPerf=1
+                            break;
+                        fi
+                    done
+                    if [ $foundWorkingPerf -eq 0 ]
                     then
-                        perfcmd=$perf316Cmd
+                        FatalError "Unable to find a working copy of perf.  Try re-installing via ./perfcollect install."
                     fi
+                    WriteStatus "...FINISHED"
                 fi
             fi
         fi
@@ -929,6 +942,34 @@ GetCommandFullPath()
 ######################################
 # Prerequisite Installation
 ######################################
+
+IsMariner()
+{
+    local mariner=0
+    if [ -f /etc/lsb-release ]
+    then
+        local flavor=`cat /etc/lsb-release | grep DISTRIB_ID`
+        if [ "$flavor" == "DISTRIB_ID=\"Mariner\"" ]
+        then
+            mariner=1
+        fi
+    fi
+
+    echo $mariner
+}
+
+InstallPerf_Mariner()
+{
+    # Disallow non-root users.
+    EnsureRoot
+
+    # Install perf
+    tdnf install -y kernel-tools
+
+    # Install zip and unzip
+    tdnf install -y zip unzip
+}
+
 IsAlpine()
 {
     local alpine=0
@@ -1061,7 +1102,7 @@ InstallPerf_Ubuntu()
     then
         apt-get install -y linux-tools-azure zip software-properties-common
     else
-        apt-get install -y linux-tools-common linux-tools-`uname -r` linux-cloud-tools-`uname -r` zip software-properties-common
+        apt-get install -y linux-tools-common linux-tools-`uname -r` zip software-properties-common
     fi
 }
 
@@ -1082,6 +1123,9 @@ InstallPerf()
     elif [ "$(IsAlpine)" == "1" ]
     then
         InstallPerf_Alpine
+    elif [ "$(IsMariner)" == "1" ]
+    then
+        InstallPerf_Mariner
     else
         FatalError "Auto install unsupported for this distribution.  Install perf manually to continue."
     fi
@@ -1205,6 +1249,16 @@ InstallLTTng_Ubuntu()
 
 InstallLTTng()
 {
+    if command -v lttng &> /dev/null
+    then
+        lttngInstalled=1
+
+        BlueText
+        echo "LTTng already installed."
+        ResetText
+        return
+    fi
+
     if [ "$(IsUbuntu)" == "1" ]
     then
         InstallLTTng_Ubuntu
@@ -1217,6 +1271,9 @@ InstallLTTng()
     elif [ "$(IsRHEL)" == "1" ]
     then
         InstallLTTng_RHEL
+    elif [ "$(IsMariner)" == "1" ]
+    then
+        echo "Collection of events from lttng-ust is not supported on Mariner for .NET workloads, so no lttng-ust events will be collected."
     elif [ "$(IsAlpine)" == "1" ]
     then
         echo "lttng-tools is not available on Alpine Linux, so no lttng-ust events will be collected."
@@ -1228,7 +1285,7 @@ InstallLTTng()
 SupportsAutoInstall()
 {
     local supportsAutoInstall=0
-    if [ "$(IsUbuntu)" == "1" ] || [ "$(IsSUSE)" == "1" ]
+    if [ "$(IsUbuntu)" == "1" ] || [ "$(IsSUSE)" == "1" ] || [ "$(IsMariner)" == "1" ]
     then
         supportsAutoInstall=1
     fi
@@ -1254,8 +1311,8 @@ EnsurePrereqsInstalled()
         exit 1
     fi
 
-    # Disable LTTng use if running on Alpine.
-    if [ "$(IsAlpine)" == "1" ]
+    # Disable LTTng use if running on Alpine or Mariner.
+    if [ "$(IsAlpine)" == "1" ] || [ "$(IsMariner)" == "1" ]
     then
         useLTTng=0
     fi
@@ -1308,6 +1365,7 @@ gcCollectOnly=''
 gcOnly=''
 gcWithHeap=''
 events=''
+rawevents=''
 
 ProcessArguments()
 {
@@ -1315,7 +1373,7 @@ ProcessArguments()
     action=$1
 
     # Actions with no arguments.
-    if [ "$action" == "livetrace" ]
+    if [ "$action" == "livetrace" ] || [ "$action" == "setenv" ]
     then
         return
     fi
@@ -1357,7 +1415,8 @@ ProcessArguments()
             local value=${args[$i+1]}
 
             # Keep the cases of '-events' value to match keyword variables
-            if [ "-events" != "$arg" ]
+            # Keep the cases of '-rawevents'
+            if [ "-events" != "$arg" ] && [ "-rawevents" != "$arg" ]
             then
                 # Convert the value to lower case.
                 value=`echo $value | tr '[:upper:]' '[:lower:]'`
@@ -1385,6 +1444,9 @@ ProcessArguments()
             # Perf doesn't support capturing cpu-clock events and sched events concurrently.
             collect_cpu=0
             collect_offcpu=1
+        elif [ "-system" == "$arg" ]
+        then
+            collect_system=1
         elif [ "-hwevents" == "$arg" ]
         then
             collect_HWevents=1
@@ -1420,6 +1482,10 @@ ProcessArguments()
         elif [ "-events" == "$arg" ]
         then
             events=$value
+            i=$i+1
+        elif [ "-rawevents" == "$arg" ]
+        then
+            rawevents=$value
             i=$i+1
         elif [ "-collectsec" == "$arg" ]
         then
@@ -1503,11 +1569,11 @@ SetupLTTngSession()
         elif [ "$events" == "threading" ]
         then
             EnableLTTngEvents ${DotNETRuntime_ThreadingKeyword[@]}
-        else     
+        else
             # Enable other keywords
             events=(${events//","/" "})
             for event in ${events[@]}
-            do 
+            do
                 if [ "${!event}" == "" ] || [ "$( echo `declare -p $event | grep -- -a` )" == "" ]
                 then
                     echo Invalid keyword $event, skipped...
@@ -1520,6 +1586,14 @@ SetupLTTngSession()
                 else
                     EnableLTTngEvents ${keywords[@]}
                 fi
+            done
+        fi
+        if [ "$rawevents" != "" ]
+        then
+            rawevents=(${rawevents//","/" "})
+            for rawevent in ${rawevents[@]}
+            do
+                EnableLTTngEvents $rawevent
             done
         fi
     fi
@@ -1773,26 +1847,23 @@ ProcessCollectedData()
 
         outputDumpFile="perf.data.txt"
 
-        # I've not found a good way to get the behavior that we want here - running the command and redirecting the output
-        # when passing the command line to a function.  Thus, this case is hardcoded.
-
-        # There is a breaking change where the capitalization of the -f parameter changed.
-        LogAppend "Running $perfcmd script -i $inputFile -F comm,pid,tid,cpu,time,period,event,ip,sym,dso,trace > $outputDumpFile"
-        $perfcmd script -i $inputFile -F comm,pid,tid,cpu,time,period,event,ip,sym,dso,trace > $outputDumpFile 2>>$logFile
+        LogAppend "Running $perfcmd script -i $inputFile --fields comm,pid,tid,cpu,time,period,event,ip,sym,dso,trace > $outputDumpFile"
+        $perfcmd script -i $inputFile --fields comm,pid,tid,cpu,time,period,event,ip,sym,dso,trace > $outputDumpFile 2>>$logFile
         LogAppend
 
+        # Try capturing without the cpu field which is unavailable in some containerized environments.
         if [ $? -ne 0 ]
         then
-            LogAppend "Running $perfcmd script -i $inputFile -f comm,pid,tid,cpu,time,period,event,ip,sym,dso,trace > $outputDumpFile"
-            $perfcmd script -i $inputFile -f comm,pid,tid,cpu,time,period,event,ip,sym,dso,trace > $outputDumpFile 2>>$logFile
+            LogAppend "Running $perfcmd script -i $inputFile --fields comm,pid,tid,time,period,event,ip,sym,dso,trace > $outputDumpFile"
+            $perfcmd script -i $inputFile --fields comm,pid,tid,time,period,event,ip,sym,dso,trace > $outputDumpFile 2>>$logFile
             LogAppend
         fi
 
         # If the dump file is zero length, try to collect without the period field, which was added recently.
         if [ ! -s $outputDumpFile ]
         then
-            LogAppend "Running $perfcmd script -i $inputFile -f comm,pid,tid,cpu,time,event,ip,sym,dso,trace > $outputDumpFile"
-            $perfcmd script -i $inputFile -f comm,pid,tid,cpu,time,event,ip,sym,dso,trace > $outputDumpFile 2>>$logFile
+            LogAppend "Running $perfcmd script -i $inputFile --fields comm,pid,tid,time,event,ip,sym,dso,trace > $outputDumpFile"
+            $perfcmd script -i $inputFile --fields comm,pid,tid,time,event,ip,sym,dso,trace > $outputDumpFile 2>>$logFile
             LogAppend
         fi
 
@@ -1939,6 +2010,11 @@ BuildPerfRecordArgs()
         then
             collectionArgs="$collectionArgs -F 1000"
         fi
+    fi
+
+    if [ $collect_system -eq 1 ]
+    then
+        collectionArgs="$collectionArgs -e major-faults -e minor-faults"
     fi
 
     # Enable HW counters event collection
@@ -2101,6 +2177,14 @@ PropSymbolsAndMapFilesForView()
     done
 }
 
+SetEnvironment()
+{
+    WriteStatus "Starting a new shell configured for profiling."
+    WriteStatus "When done, type 'exit' to exit the profiling shell."
+    bash -c 'export COMPlus_PerfMapEnabled=1;export COMPlus_EnableEventLog=1; exec bash'
+    WriteStatus "Profiling shell exited."
+}
+
 DoView()
 {
     # Generate a temp directory to extract the trace files into.
@@ -2193,6 +2277,9 @@ then
 elif [ "$action" == "stop" ]
 then
     EndCollect
+elif [ "$action" == "setenv" ]
+then
+    SetEnvironment
 elif [ "$action" == "view" ]
 then
     DoView

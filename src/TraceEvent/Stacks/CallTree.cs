@@ -7,6 +7,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;                        // For TextWriter.  
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
@@ -19,7 +20,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
     public class CallTree
     {
         /// <summary>
-        /// Creates an empty call tree, indicating the scaling policy of the metric.   You populate it by assigning a StackSOurce to the tree.  
+        /// Creates an empty call tree, indicating the scaling policy of the metric.   You populate it by assigning a StackSource to the tree.  
         /// </summary>
         public CallTree(ScalingPolicyKind scalingPolicy)
         {
@@ -65,6 +66,10 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 {
                     value.ParallelForEach(AddSample);
                 }
+
+                // Initialize the inclusive metrics
+                InitializeInclusiveMetrics();
+
                 // And the basis for forming the % is total metric of stackSource.  
                 PercentageBasis = Math.Abs(Root.InclusiveMetric);       // People get confused if this swaps. 
 
@@ -81,16 +86,18 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// When calculating percentages, the PercentageBasis do we use as 100%.  By default we use the
         /// Inclusive time for the root, but that can be changed here.  
         /// </summary>
-        public float PercentageBasis { get; set; }
+        public double PercentageBasis { get; set; }
 
         /// <summary>
         /// Returns the root node of the call tree.  
         /// </summary>
         public CallTreeNode Root { get { return m_root; } }
 
+        public Interner Interner => m_interner;
+
         /// <summary>
         /// An upper bound for the node indexes in the call tree.  (All indexes
-        /// are strictly less than this number)   Thus ASSSUMING YOU DON'T ADD
+        /// are strictly less than this number)   Thus ASSUMING YOU DON'T ADD
         /// NEW NODES, an array of this size can be used to index the nodes (and 
         /// thus lookup nodes by index or to store additional information about a node).  
         /// </summary>
@@ -140,11 +147,11 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// node will have less than minInclusiveMetric.  
         /// 
         /// </summary>
-        public int FoldNodesUnder(float minInclusiveMetric, bool useWholeTraceMetric)
+        public int FoldNodesUnder(double minInclusiveMetric, bool useWholeTraceMetric)
         {
             m_root.CheckClassInvarients();
 
-            // If we filter by whole trace metric we need to cacluate the byID sums.  
+            // If we filter by whole trace metric we need to calculate the byID sums.  
             Dictionary<int, CallTreeNodeBase> sumByID = null;
             if (useWholeTraceMetric)
             {
@@ -159,14 +166,14 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         /// <summary>
-        /// Cause the children of each CallTreeNode in the CallTree to be sorted (accending) based on comparer
+        /// Cause the children of each CallTreeNode in the CallTree to be sorted (ascending) based on comparer
         /// </summary>
         public void Sort(IComparer<CallTreeNode> comparer)
         {
             m_root.SortAll(comparer);
         }
         /// <summary>
-        /// Sorting by InclusiveMetric Decending is so common, provide a shortcut.  
+        /// Sorting by InclusiveMetric Descending is so common, provide a shortcut.  
         /// </summary>
         public void SortInclusiveMetricDecending()
         {
@@ -177,12 +184,20 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 {
                     return ret;
                 }
-                // Sort by first sample time (assending) if the counts are the same.  
+                // Sort by first sample time (ascending) if the counts are the same.  
                 return x.FirstTimeRelativeMSec.CompareTo(y.FirstTimeRelativeMSec);
             });
 
             Sort(comparer);
         }
+
+        private class FunctorComparer<T> : IComparer<T>
+        {
+            public FunctorComparer(Comparison<T> comparison) { this.comparison = comparison; }
+            public int Compare(T x, T y) { return comparison(x, y); }
+
+            private Comparison<T> comparison;
+        };
 
         /// <summary>
         /// When converting the InclusiveMetricByTime to a InclusiveMetricByTimeString you have to decide 
@@ -190,8 +205,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// </summary>
         public ScalingPolicyKind ScalingPolicy { get; private set; }
         /// <summary>
-        /// The nodes in the calltree have histograms in time, all of these histograms share a controller that
-        /// contains sharable information.   This propertly returns that TimeHistogramController
+        /// The nodes in the CallTree have histograms in time, all of these histograms share a controller that
+        /// contains sharable information.   This property returns that TimeHistogramController
         /// </summary>
         public TimeHistogramController TimeHistogramController
         {
@@ -207,9 +222,9 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             }
         }
         /// <summary>
-        /// The nodes in the calltree have histograms indexed by scenario (which is user defiend), 
+        /// The nodes in the CallTree have histograms indexed by scenario (which is user defined), 
         /// all of these histograms share a controller that contains sharable information.   
-        /// This propertly returns that ScenarioHistogramController
+        /// This property returns that ScenarioHistogramController
         /// </summary>
         public ScenarioHistogramController ScenarioHistogram
         {
@@ -253,7 +268,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         /// <summary>
-        /// Write an XML representtaion of the CallTree to 'writer'
+        /// Write an XML representation of the CallTree to 'writer'
         /// </summary>
         public void ToXml(TextWriter writer)
         {
@@ -262,7 +277,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             writer.WriteLine("</CallTree>");
         }
         /// <summary>
-        /// An XML representtaion of the CallTree (for debugging)
+        /// An XML representation of the CallTree (for debugging)
         /// </summary>
         public override string ToString()
         {
@@ -278,8 +293,10 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         // This keeps track of stacks that I have used in the past
-        private const int StackInfoCacheSize = 128;          // Must be a power of 2
+        private const int StackInfoCacheSize = 128 * 1024;          // Must be a power of 2
         private TreeCacheEntry[] m_TreeForStack;
+
+        private readonly Interner m_interner = new Interner();
 
         // Maps frame IDs to their canonical one (we group all frame IDs)
         internal StackSourceFrameIndex[] m_canonicalID;        // Maps frame IDs to their canonical one
@@ -335,6 +352,10 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             return retNode;
         }
 
+        /// <summary>
+        /// ⚠ This method does not initialize inclusive counts. Call <see cref="InitializeInclusiveMetrics"/> to
+        /// complete the initialization of the tree.
+        /// </summary>
         private void AddSample(StackSourceSample sample)
         {
             var callTreeNode = FindTreeNode(sample.StackIndex);
@@ -350,6 +371,10 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             }
         }
 
+        /// <summary>
+        /// ⚠ This method does not initialize inclusive counts. Call <see cref="InitializeInclusiveMetrics"/> to
+        /// complete the initialization of the tree.
+        /// </summary>
         private void AddSampleToTreeNode(CallTreeNode treeNode, StackSourceSample sample)
         {
             // Add the sample to treeNode.
@@ -374,7 +399,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             var sampleEndTime = sample.TimeRelativeMSec;
             if (ScalingPolicy == ScalingPolicyKind.TimeMetric)
             {
-                // The sample ends at the end of its metric, however we trucate at the end of the range.  
+                // The sample ends at the end of its metric, however we truncate at the end of the range.  
 
                 // The Math.Abs is a bit of a hack.  The problem is that that sample does not
                 // represent time for a DIFF (because we negated it) but I rely on the fact 
@@ -389,18 +414,17 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             // And update all the inclusive times up the tree to the root (including this node)
             while (treeNode != null)
             {
+                if (treeNode.m_inclusiveCount == 0)
+                {
+                    // This node is not yet initialized; will be handled in a post-processing pass
+                    break;
+                }
+
                 treeNode.m_inclusiveCount += sample.Count;
                 treeNode.m_inclusiveMetric += sample.Metric;
 
-                if (treeNode.InclusiveMetricByTime != null)
-                {
-                    treeNode.InclusiveMetricByTime.AddSample(sample);
-                }
-
-                if (treeNode.InclusiveMetricByScenario != null)
-                {
-                    treeNode.InclusiveMetricByScenario.AddSample(sample);
-                }
+                treeNode.InclusiveMetricByTime?.AddSample(sample);
+                treeNode.InclusiveMetricByScenario?.AddSample(sample);
 
                 if (sample.TimeRelativeMSec < treeNode.m_firstTimeRelativeMSec)
                 {
@@ -415,6 +439,117 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 Debug.Assert(treeNode.m_firstTimeRelativeMSec <= treeNode.m_lastTimeRelativeMSec);
 
                 treeNode = treeNode.Caller;
+            }
+        }
+
+        /// <summary>
+        /// Initializes the <see cref="CallTreeNodeBase.m_inclusiveCount"/> and related fields following calls to
+        /// <see cref="AddSample(StackSourceSample)"/> that populate the tree.
+        /// </summary>
+        private void InitializeInclusiveMetrics()
+        {
+            if (m_root.m_inclusiveCount != 0)
+            {
+                return;
+            }
+
+            var parentWorkSet = new HashSet<CallTreeNode>();
+            Action<StackSourceSample> action = sample =>
+            {
+                var node = FindTreeNode(sample.StackIndex);
+                node.m_inclusiveCount = node.m_exclusiveCount;
+                node.m_inclusiveMetric = node.m_exclusiveMetric;
+                node.m_firstTimeRelativeMSec = Math.Min(node.m_firstTimeRelativeMSec, sample.TimeRelativeMSec);
+
+                var sampleEndTime = sample.TimeRelativeMSec;
+                if (ScalingPolicy == ScalingPolicyKind.TimeMetric)
+                {
+                    // The sample ends at the end of its metric, however we trucate at the end of the range.  
+
+                    // The Math.Abs is a bit of a hack.  The problem is that that sample does not
+                    // represent time for a DIFF (because we negated it) but I rely on the fact 
+                    // that we only negate it so I can undo it 
+                    sampleEndTime += Math.Abs(sample.Metric);
+                    if (TimeHistogramController != null && sampleEndTime > TimeHistogramController.End)
+                    {
+                        sampleEndTime = TimeHistogramController.End;
+                    }
+                }
+
+                node.m_lastTimeRelativeMSec = Math.Max(node.m_lastTimeRelativeMSec, sampleEndTime);
+
+                node.InclusiveMetricByTime?.AddSample(sample);
+                node.InclusiveMetricByScenario?.AddSample(sample);
+
+                parentWorkSet.Add(node);
+            };
+
+            m_SampleInfo.ForEach(action);
+
+            while (parentWorkSet.Count > 0)
+            {
+                var processedInCurrentSet = new HashSet<CallTreeNode>();
+                var nextParentWorkSet = new HashSet<CallTreeNode>();
+                foreach (var node in parentWorkSet.OrderByDescending(n => (int)n.Index))
+                {
+                    processedInCurrentSet.Add(node);
+
+                    var caller = node.Caller;
+                    if (caller == null)
+                    {
+                        continue;
+                    }
+
+                    for (var current = caller; current != null; current = current.Caller)
+                    {
+                        if (current.m_inclusiveCount == 0)
+                        {
+                            if (current != caller)
+                            {
+                                break;
+                            }
+
+                            current.m_inclusiveCount = current.m_exclusiveCount;
+                            current.m_inclusiveMetric = current.m_exclusiveMetric;
+
+                            // Only add the caller when it's initialized
+                            nextParentWorkSet.Add(caller);
+                        }
+
+                        if (current.InclusiveMetricByTime != null)
+                        {
+                            int index = 0;
+                            foreach (var sample in node.InclusiveMetricByTime)
+                            {
+                                current.InclusiveMetricByTime.AddMetric(sample, index);
+                                index++;
+                            }
+                        }
+
+                        if (current.InclusiveMetricByScenario != null)
+                        {
+                            int index = 0;
+                            foreach (var sample in node.InclusiveMetricByScenario)
+                            {
+                                current.InclusiveMetricByScenario.AddMetric(sample, index);
+                                index++;
+                            }
+                        }
+
+                        current.m_inclusiveCount += node.m_inclusiveCount;
+                        current.m_inclusiveMetric += node.m_inclusiveMetric;
+                        current.m_firstTimeRelativeMSec = Math.Min(current.m_firstTimeRelativeMSec, node.m_firstTimeRelativeMSec);
+                        current.m_lastTimeRelativeMSec = Math.Max(current.m_lastTimeRelativeMSec, node.m_lastTimeRelativeMSec);
+
+                        if (nextParentWorkSet.Contains(current)
+                            || (parentWorkSet.Contains(current) && !processedInCurrentSet.Contains(current)))
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                parentWorkSet = nextParentWorkSet;
             }
         }
 
@@ -569,7 +704,10 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// <summary>
         /// The Frame name that this tree node represents.   
         /// </summary>
-        public string Name { get { return m_name; } }
+        public string Name { get { return m_name.ToString(); } }
+
+        public int NameId => m_name.Index;
+
         /// <summary>
         /// Currently the same as Name, but could contain additional info.  
         /// Suitable for display but not for programmatic comparison.  
@@ -600,45 +738,45 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// <summary>
         /// The sum of the metric of all samples that are in this node or any child of this node (recursively)
         /// </summary>
-        public float InclusiveMetric { get { return m_inclusiveMetric; } }
+        public double InclusiveMetric { get { return m_inclusiveMetric; } }
         /// <summary>
         /// The average metric of all samples that are in this node or any child of this node (recursively).
         /// This is simply InclusiveMetric / InclusiveCount.
         /// </summary>
-        public float AverageInclusiveMetric { get { return m_inclusiveMetric / m_inclusiveCount; } }
+        public double AverageInclusiveMetric { get { return m_inclusiveMetric / m_inclusiveCount; } }
         /// <summary>
         /// The sum of the metric of all samples that are in this node 
         /// </summary>
-        public float ExclusiveMetric { get { return m_exclusiveMetric; } }
+        public double ExclusiveMetric { get { return m_exclusiveMetric; } }
         /// <summary>
         /// The sum of the metric of all samples in this node that are there because they were folded (inlined).   It is always less than or equal to ExclusiveMetric.  
         /// </summary>
-        public float ExclusiveFoldedMetric { get { return m_exclusiveFoldedMetric; } }
+        public double ExclusiveFoldedMetric { get { return m_exclusiveFoldedMetric; } }
         /// <summary>
         /// The sum of the count of all samples that are in this node or any child of this node (recursively)
         /// </summary>
-        public float InclusiveCount { get { return m_inclusiveCount; } }
+        public double InclusiveCount { get { return m_inclusiveCount; } }
         /// <summary>
         /// The sum of the count of all samples that are in this node 
         /// </summary>
-        public float ExclusiveCount { get { return m_exclusiveCount; } }
+        public double ExclusiveCount { get { return m_exclusiveCount; } }
         /// <summary>
         /// The sum of the count of all samples in this node that are there because they were folded (inlined).   It is always less than or equal to ExclusiveCount.  
         /// </summary>
-        public float ExclusiveFoldedCount { get { return m_exclusiveFoldedCount; } }
+        public double ExclusiveFoldedCount { get { return m_exclusiveFoldedCount; } }
 
         /// <summary>
         /// The inclusive metric, normalized to the total metric for the entire tree.  
         /// </summary>
-        public float InclusiveMetricPercent { get { return m_inclusiveMetric * 100 / m_callTree.PercentageBasis; } }
+        public double InclusiveMetricPercent { get { return m_inclusiveMetric * 100 / m_callTree.PercentageBasis; } }
         /// <summary>
         /// The exclusive metric, normalized to the total metric for the entire tree.  
         /// </summary>
-        public float ExclusiveMetricPercent { get { return m_exclusiveMetric * 100 / m_callTree.PercentageBasis; } }
+        public double ExclusiveMetricPercent { get { return m_exclusiveMetric * 100 / m_callTree.PercentageBasis; } }
         /// <summary>
         /// The exclusive folded metric, normalized to the total metric for the entire tree.  
         /// </summary>
-        public float ExclusiveFoldedMetricPercent { get { return m_exclusiveFoldedMetric * 100 / m_callTree.PercentageBasis; } }
+        public double ExclusiveFoldedMetricPercent { get { return m_exclusiveFoldedMetric * 100 / m_callTree.PercentageBasis; } }
 
         /// <summary>
         /// The time of the first sample for this node or any of its children (recursively)
@@ -752,7 +890,9 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 }
             }
             else
+            {
                 Debug.Assert(count == InclusiveCount);
+            }
 #endif
             return count;
         }
@@ -763,8 +903,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// It calls 'callback' on a set of trees that taken as a whole have all the samples
         /// in 'node'.  
         /// 
-        /// Note you ave to be careful when using this for inclusive summation of byname nodes because 
-        /// you will get trees that 'overlap' (bname nodes might refer into the 'middle' of another
+        /// Note you have to be careful when using this for inclusive summation of ByName nodes because 
+        /// you will get trees that 'overlap' (ByName nodes might refer into the 'middle' of another
         /// call tree).   This can be avoided pretty easily by simply stopping inclusive traversal 
         /// whenever a tree node with that ID occurs (see GetSamples for an example). 
         /// </summary>
@@ -817,7 +957,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         /// <summary>
-        /// The GUI sadly holds on to Call things in the model in its cache, and call tree nodes have linkes to whole
+        /// The GUI sadly holds on to Call things in the model in its cache, and call tree nodes have links to whole
         /// call tree.  To avoid the GUI cache from holding on to the ENTIRE MODEL, we neuter the nodes when we are
         /// done with them so that even if they are pointed to by the GUI cache it does not hold onto most of the 
         /// (dead) model.    FreeMemory does this neutering.  
@@ -836,7 +976,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         {
             m_samples.Clear();
             m_nextSameId = null;
-            m_name = null;
+            m_name = default(Interner.Key);
             m_callTree = null;
             m_inclusiveMetricByTime = null;
             m_inclusiveMetricByScenario = null;
@@ -853,7 +993,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 name = name.Substring(0, idx);
             }
 
-            m_name = name;
+            m_name = container.Interner.Intern(name);
             m_callTree = container;
             m_id = id;
             m_firstTimeRelativeMSec = Double.PositiveInfinity;
@@ -883,8 +1023,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         {
             if (addInclusive)
             {
-                m_inclusiveMetric += (float)(other.m_inclusiveMetric * weight);
-                m_inclusiveCount += (float)(other.m_inclusiveCount * weight);
+                m_inclusiveMetric += other.m_inclusiveMetric * weight;
+                m_inclusiveCount += other.m_inclusiveCount * weight;
                 if (m_inclusiveMetricByTime != null && other.m_inclusiveMetricByTime != null)
                 {
                     m_inclusiveMetricByTime.AddScaled(other.m_inclusiveMetricByTime, weight);
@@ -898,10 +1038,10 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
 
             if (addExclusive)
             {
-                m_exclusiveMetric += (float)(other.m_exclusiveMetric * weight);
-                m_exclusiveCount += (float)(other.m_exclusiveCount * weight);
-                m_exclusiveFoldedMetric += (float)(other.m_exclusiveFoldedMetric * weight);
-                m_exclusiveFoldedCount += (float)(other.m_exclusiveFoldedCount * weight);
+                m_exclusiveMetric += other.m_exclusiveMetric * weight;
+                m_exclusiveCount += other.m_exclusiveCount * weight;
+                m_exclusiveFoldedMetric += other.m_exclusiveFoldedMetric * weight;
+                m_exclusiveFoldedCount += other.m_exclusiveFoldedCount * weight;
             }
 
             if (other.m_firstTimeRelativeMSec < m_firstTimeRelativeMSec)
@@ -918,10 +1058,10 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         /// <summary>
-        /// To avoid double-counting for byname nodes, with we can be told to exclude any children with a particular ID 
+        /// To avoid double-counting for ByName nodes, with we can be told to exclude any children with a particular ID 
         /// (the ID of the ByName node itself) if are doing the inclusive case.   The goal is to count every reachable
         /// tree exactly once.  We do this by conceptually 'marking' each node with ID at the top level (when they are 
-        /// enumerated as children of the Byname node), and thus any node with that excludeChildrenWithID is conceptually
+        /// enumerated as children of the ByName node), and thus any node with that excludeChildrenWithID is conceptually
         /// marked if you encounter it as a child in the tree itself (so you should exclude it).  The result is that 
         /// every node is visited exactly once (without the expense of having a 'visited' bit).  
         /// </summary>
@@ -957,9 +1097,13 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             // The number of samples does not equal the InclusiveCount on intermediate nodes if we have 
             // recursion because we are excluding some of the samples to avoid double counting
             if (exclusive)
+            {
                 Debug.Assert(count == curNode.ExclusiveCount);
+            }
             else
+            {
                 Debug.Assert(count == curNode.InclusiveCount || excludeChildrenWithID != StackSourceFrameIndex.Invalid);
+            }
 #endif
             return count;
         }
@@ -976,14 +1120,14 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         internal StackSourceFrameIndex m_id;
-        internal string m_name;
+        internal Interner.Key m_name;
         internal CallTree m_callTree;                                   // The call tree this node belongs to. 
-        internal float m_inclusiveMetric;
-        internal float m_inclusiveCount;
-        internal float m_exclusiveMetric;
-        internal float m_exclusiveCount;
-        internal float m_exclusiveFoldedMetric;
-        internal float m_exclusiveFoldedCount;
+        internal double m_inclusiveMetric;
+        internal double m_inclusiveCount;
+        internal double m_exclusiveMetric;
+        internal double m_exclusiveCount;
+        internal double m_exclusiveFoldedMetric;
+        internal double m_exclusiveFoldedCount;
         internal double m_firstTimeRelativeMSec;
         internal double m_lastTimeRelativeMSec;
         private CallTreeNodeIndex m_index;
@@ -1126,7 +1270,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// 
         /// This is a utility function.  
         /// </summary>
-        public float GetBrokenStackCount()
+        public double GetBrokenStackCount()
         {
             return GetBrokenStackCount(4);
         }
@@ -1189,7 +1333,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         /// <summary>
-        /// Sort the childre of every node in the te
+        /// Sort the children of every node in the tree
         /// </summary>
         /// <param name="comparer"></param>
         internal void SortAll(IComparer<CallTreeNode> comparer, RecursionGuard recursionGuard = default(RecursionGuard))
@@ -1229,15 +1373,15 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             Debug.Assert(source.IsGraphSource);
             Debug.Assert(samplesToNodes != null);
 
-            var childrenSet = new Dictionary<string, CallTreeNode>();
+            var childrenSet = default(GrowableArray<CallTreeNode>);
             // Exclude myself
-            childrenSet[Name] = null;
+            childrenSet.Set(NameId, this);
             // Exclude the primary children
             if (Callees != null)
             {
                 foreach (var callee in Callees)
                 {
-                    childrenSet[callee.Name] = null;
+                    childrenSet.Set(callee.NameId, this);
                 }
             }
 
@@ -1291,17 +1435,18 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                     var childNode = samplesToNodes[(int)childIndex];
                     if (childNode != null)       // TODO FIX NOW: I would not think this check would be needed.  
                     {
-                        CallTreeNode graphChild;
-                        if (!childrenSet.TryGetValue(childNode.Name, out graphChild))
+                        CallTreeNode graphChild = childrenSet.Get(childNode.NameId);
+                        if (graphChild == null)
                         {
-                            childrenSet[childNode.Name] = graphChild = new CallTreeNode(childNode.Name, childNode.ID, this, CallTree);
+                            graphChild = new CallTreeNode(childNode.Name, childNode.ID, this, CallTree);
+                            childrenSet.Set(childNode.NameId, graphChild);
                             graphChild.IsCalleeTree = IsCalleeTree;
                             graphChild.m_isGraphNode = true;
                             graphChild.m_minDepth = int.MaxValue;
                         }
 
                         // Add the sample 
-                        if (graphChild != null)
+                        if (graphChild != this)
                         {
                             graphChild.m_minDepth = Math.Min(childNode.Depth(), graphChild.m_minDepth);
                             graphChild.m_samples.Add(childIndex);
@@ -1316,9 +1461,9 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
 
             // Sort by min depth then name.  
             var ret = new List<CallTreeNode>();
-            foreach (var val in childrenSet.Values)
+            foreach (var val in childrenSet)
             {
-                if (val != null)
+                if (val != null && val != this)
                 {
                     ret.Add(val);
                 }
@@ -1344,7 +1489,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         }
 
         /// <summary>
-        /// Some calltrees already fill in their children, others do so lazily, in which case they 
+        /// Some CallTrees already fill in their children, others do so lazily, in which case they 
         /// override this method.  
         /// </summary>
         protected virtual List<CallTreeNode> GetCallees() { return null; }
@@ -1353,7 +1498,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// Fold away any nodes having less than 'minInclusiveMetric'.  If 'sumByID' is non-null then the 
         /// only nodes that have a less then the minInclusiveMetric for the whole trace are folded. 
         /// </summary>
-        internal int FoldNodesUnder(float minInclusiveMetric, Dictionary<int, CallTreeNodeBase> sumByID)
+        internal int FoldNodesUnder(double minInclusiveMetric, Dictionary<int, CallTreeNodeBase> sumByID)
         {
             int nodesFolded = 0;
             if (Callees != null)
@@ -1363,8 +1508,9 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 {
                     var callee = m_callees[from];
                     // We don't fold away Broken stacks ever.  
-                    if (Math.Abs(callee.InclusiveMetric) < minInclusiveMetric && callee.m_id != StackSourceFrameIndex.Broken &&
-                    (sumByID == null || callee.IsFoldable(minInclusiveMetric, sumByID)))
+                    if (Math.Abs(callee.InclusiveMetric) < minInclusiveMetric
+                        && callee.m_id != StackSourceFrameIndex.Broken
+                        && (sumByID == null || callee.IsFoldable(minInclusiveMetric, sumByID)))
                     {
                         // TODO the samples are no longer in time order, do we care?
                         nodesFolded++;
@@ -1405,8 +1551,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             return nodesFolded;
         }
 
-        // TODO FIX NOW: decide what to do here, we originally did a recursive IsFolable but that causes very little folding. 
-        private bool IsFoldable(float minInclusiveMetric, Dictionary<int, CallTreeNodeBase> sumByID)
+        // TODO FIX NOW: decide what to do here, we originally did a recursive IsFoldable but that causes very little folding. 
+        private bool IsFoldable(double minInclusiveMetric, Dictionary<int, CallTreeNodeBase> sumByID)
         {
             return Math.Abs(sumByID[(int)m_id].InclusiveMetric) < minInclusiveMetric;
         }
@@ -1460,7 +1606,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             {
                 if (m_callees != null)
                 {
-                    // Optimization.   If we have large fanout, we create a dictionary 
+                    // Optimization.   If we have large fan-out, we create a dictionary 
                     if (m_callees.Count > 16)
                     {
                         // Do we have the dictionary of dictionaries? If not make one
@@ -1519,7 +1665,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
 
                 m_callees.Add(callee);
 
-                // If this node had large fanout also add it to that lookup table.  
+                // If this node had large fan-out also add it to that lookup table.  
                 if (calleeLookup != null)
                 {
                     calleeLookup[callee.m_id] = callee;
@@ -1547,7 +1693,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             return ret;
         }
 
-        private float GetBrokenStackCount(int depth = 4)
+        private double GetBrokenStackCount(int depth = 4)
         {
             if (depth <= 0)
             {
@@ -1559,7 +1705,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 return InclusiveCount;
             }
 
-            float ret = 0;
+            double ret = 0;
             if (Callees != null)
             {
                 foreach (var child in Callees)
@@ -1574,8 +1720,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         [Conditional("DEBUG")]
         internal void CheckClassInvarients()
         {
-            float sum = m_exclusiveMetric;
-            float count = m_exclusiveCount;
+            double sum = m_exclusiveMetric;
+            double count = m_exclusiveCount;
             if (m_callees != null)
             {
                 for (int i = 0; i < Callees.Count; i++)
@@ -1602,7 +1748,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
     }
 
     /// <summary>
-    /// A CallerCalleeNode gives statistics that focus on a NAME.  (unlike calltrees that use ID)
+    /// A CallerCalleeNode gives statistics that focus on a NAME.  (unlike CallTrees that use ID)
     /// It takes all stackSource that have callStacks that include that treeNode and compute the metrics for
     /// all the callers and all the callees for that treeNode.  
     /// </summary>
@@ -1634,16 +1780,23 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             m_callersByName = null;
             m_callers.Sort((x, y) => Math.Abs(y.InclusiveMetric).CompareTo(Math.Abs(x.InclusiveMetric)));
 #if DEBUG
-            float callerSum = 0;
+            double callerSum = 0;
             foreach (var caller in m_callers)
+            {
                 callerSum += caller.m_inclusiveMetric;
+            }
 
-            float calleeSum = 0;
+            double calleeSum = 0;
             foreach (var callee in m_callees)
+            {
                 calleeSum += callee.m_inclusiveMetric;
+            }
 
             if (this.Name != m_callTree.Root.Name)
+            {
                 Debug.Assert(Math.Abs(callerSum - m_inclusiveMetric) <= .001);
+            }
+
             Debug.Assert(Math.Abs(calleeSum + m_exclusiveMetric - m_inclusiveMetric) <= .001 * Math.Abs(m_inclusiveMetric));
 
             // We should get he same stats as the byID view
@@ -1683,7 +1836,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         public IList<CallTreeNodeBase> Callees { get { return m_callees; } }
 
         /// <summary>
-        /// wrtites an XML representation of the call tree Node  it 'writer'
+        /// Writes an XML representation of the call tree Node  it 'writer'
         /// </summary>
         public void ToXml(TextWriter writer, string indent)
         {
@@ -1740,7 +1893,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         #region private
         /// <summary>
         /// A caller callee view is a summation which centers around one 'focus' node which is represented by the CallerCalleeNode.
-        /// This node has a caller and callee list, and these nodes (as well as the CallerCalleNode itself) represent the aggregation
+        /// This node has a caller and callee list, and these nodes (as well as the CallerCalleeNode itself) represent the aggregation
         /// over the entire tree.
         /// 
         /// AccumulateSamplesForNode is the routine that takes a part of a aggregated call tree (represented by 'treeNode' and adds
@@ -1748,7 +1901,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// 
         /// 'recursionsCount' is the number of times the focus node name has occurred in the path from 'treeNode' to the root.   In 
         /// addition to setting the CallerCalleeNode aggregation, it also returns a 'weightedSummary' inclusive aggregation 
-        /// FOR JUST treeNode (the CallerCalleNode is an aggregation over the entire call tree accumulated so far).  
+        /// FOR JUST treeNode (the CallerCalleeNode is an aggregation over the entire call tree accumulated so far).  
         /// 
         /// The key problem for this routine to avoid is double counting of inclusive samples in the face of recursive functions. 
         /// Thus all samples are weighted by the recursion count before being included in 'weightedSummaryRet (as well as in
@@ -1789,7 +1942,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             bool isUniformRet = true;
 
             // Compute the weighting.   This is either 0 if we have not yet seen the focus node, or
-            // 1/recusionCount if we have (splitting all samples equally among each of the samples)
+            // 1/recursionCount if we have (splitting all samples equally among each of the samples)
             double weightedSummaryScaleRet = 0;
             CallTreeNodeBase weightedSummaryRet = null;          // If the weight is zero, we don't care about the value
             if (recursionCount > 0)
@@ -1803,7 +1956,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             }
 
             // Get all the samples for the children and set the calleeSum information  We also set the
-            // information in the CallerCalleNode's Callees list.  
+            // information in the CallerCalleeNode's Callees list.  
             if (treeNode.Callees != null)
             {
                 for (int i = 0; i < treeNode.m_callees.Count; i++)
@@ -1837,7 +1990,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                         {
                             isUniformRet = false;       // We ourselves are not uniform.  
 
-                            // We can no longer use the optimization of using the treenode itself as our weighted
+                            // We can no longer use the optimization of using the TreeNode itself as our weighted
                             // summary node because we need to write to it.   Thus replace the node with a copy.  
                             if (weightedSummaryRet == treeNode)
                             {
@@ -1846,8 +1999,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
 
                             // Subtract out the unweighted value and add in the weighted one
                             double scale = calleeWeightedSummaryScale / weightedSummaryScaleRet;
-                            weightedSummaryRet.m_inclusiveMetric += (float)(calleeWeightedSummary.m_inclusiveMetric * scale - treeNodeCallee.m_inclusiveMetric);
-                            weightedSummaryRet.m_inclusiveCount += (float)(calleeWeightedSummary.m_inclusiveCount * scale - treeNodeCallee.m_inclusiveCount);
+                            weightedSummaryRet.m_inclusiveMetric += calleeWeightedSummary.m_inclusiveMetric * scale - treeNodeCallee.m_inclusiveMetric;
+                            weightedSummaryRet.m_inclusiveCount += calleeWeightedSummary.m_inclusiveCount * scale - treeNodeCallee.m_inclusiveCount;
                             if (weightedSummaryRet.m_inclusiveMetricByTime != null)
                             {
                                 weightedSummaryRet.m_inclusiveMetricByTime.AddScaled(calleeWeightedSummary.m_inclusiveMetricByTime, scale);
@@ -1916,7 +2069,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
     /// <summary>
     /// AggregateCallTreeNode supports a multi-level caller-callee view.   
     /// 
-    /// It does this by allow you to take any 'focus' node (typically a byname node)
+    /// It does this by allow you to take any 'focus' node (typically a ByName node)
     /// and compute a tree of its callers and a tree of its callees.   You do this
     /// by passing the node of interested to either the 'CallerTree' or 'CalleeTrees'.
     /// 
@@ -1930,7 +2083,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
     public sealed class AggregateCallTreeNode : CallTreeNode
     {
         /// <summary>
-        /// Given any node (typically a byName node, but it works on any node), Create a 
+        /// Given any node (typically a ByName node, but it works on any node), Create a 
         /// tree rooted at 'node' that represents the callers of that node.  
         /// </summary>
         public static CallTreeNode CallerTree(CallTreeNodeBase node)
@@ -1945,7 +2098,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             return ret;
         }
         /// <summary>
-        /// Given any node (typically a byName node, but it works on any node), Create a 
+        /// Given any node (typically a ByName node, but it works on any node), Create a 
         /// tree rooted at 'node' that represents the callees of that node.  
         /// </summary>
         public static CallTreeNode CalleeTree(CallTreeNodeBase node)
@@ -2032,8 +2185,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             ret.Sort((x, y) => Math.Abs(y.InclusiveMetric).CompareTo(Math.Abs(x.InclusiveMetric)));
 #if DEBUG
             // Check that the exc time + children inc time = inc time 
-            var incCountChildren = 0.0F;
-            var incMetricChildren = 0.0F;
+            var incCountChildren = 0.0;
+            var incMetricChildren = 0.0;
 
             foreach (var callee in ret)
             {
@@ -2090,7 +2243,15 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
                 childWithID = new AggregateCallTreeNode(treeNode, this, callerOffset + 1);
                 // TODO breaking abstraction.
                 childWithID.m_id = treeForCaller.ID;
-                childWithID.m_name = treeForCaller.Name;
+                if (childWithID.CallTree == treeForCaller.CallTree)
+                {
+                    childWithID.m_name = treeForCaller.m_name;
+                }
+                else
+                {
+                    childWithID.m_name = childWithID.CallTree.Interner.Intern(treeForCaller.m_name.ToString());
+                }
+
                 callerList.Add(childWithID);
             }
 
@@ -2098,7 +2259,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
             childWithID.m_trees.Add(treeNode);
 
             // And compute our statistics.  
-            // We pass addExclusive=false to CombindByIdSamples because callers never have exclusive samples
+            // We pass addExclusive=false to CombineByIdSamples because callers never have exclusive samples
             // associated with them (because all samples occurred lower in the stack
             childWithID.CombineByIdSamples(treeNode, true, 1, false);
 
@@ -2118,8 +2279,8 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// <summary>
         /// An aggregateCallTreeNode is exactly that, the sum of several callTrees
         /// (each of which represent a number of individual samples).    Thus we had to 
-        /// take each sample (which is 'treenode' and merge it into the aggregate.
-        /// We do this one at a time.   Thus we call MergeCallee for each calltree 
+        /// take each sample (which is 'TreeNode' and merge it into the aggregate.
+        /// We do this one at a time.   Thus we call MergeCallee for each CallTree 
         /// in our list and we find the 'callees' of each of those nodes, and create 
         /// aggregates for the children (which is in calleeList).   
         /// 
@@ -2182,7 +2343,7 @@ namespace Microsoft.Diagnostics.Tracing.Stacks
         /// and subtracting out any nodes that match 'idToExclude'.   
         /// 
         /// As an optimization this routine also sets the m_recursion bit 'statsRet' if anywhere in 'treeCallee' we do find an id to 
-        /// exclude.  That way in a common case (where there is no instances of 'idToExclude') we don't have to actualy walk the
+        /// exclude.  That way in a common case (where there is no instances of 'idToExclude') we don't have to actually walk the
         /// tree the second time (we simply know that there is no adjustment necessary.   
         /// </summary>
         private static void SubtractOutTrees(CallTreeNode treeCallee, StackSourceFrameIndex idToExclude, AggregateCallTreeNode statsRet)

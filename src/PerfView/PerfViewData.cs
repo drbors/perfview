@@ -37,6 +37,7 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Media;
 using System.Xml;
+using Microsoft.Diagnostics.Tracing.Parsers.Tpl;
 using Utilities;
 using Address = System.UInt64;
 using EventSource = EventSources.EventSource;
@@ -389,6 +390,22 @@ namespace PerfView
             var ret = new PerfViewUserFile(extension + " file", new string[] { extension });
             Formats.Add(ret);
             return ret;
+        }
+
+        public static void AddTemplate(PerfViewFile file)
+        {
+            foreach (string extension in file.FileExtensions)
+            {
+                foreach (PerfViewFile potentalFormat in Formats)
+                {
+                    if (potentalFormat.IsMyFormat(extension))
+                    {
+                        throw new Exception($"The file extension '{extension}' is already handled by {potentalFormat.GetType().FullName}");
+                    }
+                }
+            }
+
+            Formats.Add(file);
         }
 
         /// <summary>
@@ -748,12 +765,7 @@ namespace PerfView
             // stackWindow.ScalingPolicy = ScalingPolicyKind.TimeMetric;
             stackWindow.IsMemoryWindow = true;
             stackWindow.FoldPercentTextBox.Text = stackWindow.GetDefaultFoldPercentage();
-            var defaultFold = "[];mscorlib!String";
-            if (!walkableObjectView)
-            {
-                stackWindow.FoldRegExTextBox.Text = defaultFold;
-            }
-            stackWindow.FoldRegExTextBox.Items.Insert(0, defaultFold);
+            stackWindow.FoldRegExTextBox.Items.Insert(0, "[];mscorlib!String");
 
             var defaultExclusions = "[not reachable from roots]";
             stackWindow.ExcludeRegExTextBox.Text = defaultExclusions;
@@ -764,10 +776,6 @@ namespace PerfView
             stackWindow.GroupRegExTextBox.Items.Insert(0, "[group module entries]  {%}!=>module $1");
 
             var defaultGroup = @"[group Framework] mscorlib!=>LIB;System%!=>LIB;";
-            if (!walkableObjectView)
-            {
-                stackWindow.GroupRegExTextBox.Text = defaultGroup;
-            }
             stackWindow.GroupRegExTextBox.Items.Insert(0, defaultGroup);
 
             stackWindow.PriorityTextBox.Text = Graphs.MemoryGraphStackSource.DefaultPriorities;
@@ -863,7 +871,8 @@ namespace PerfView
             new DiagSessionPerfViewFile(),
             new LinuxPerfViewData(),
             new XmlTreeFile(),
-            new EventPipePerfViewData()
+            new EventPipePerfViewData(),
+            new StracePerfViewData()
         };
 
         #region private
@@ -985,6 +994,7 @@ namespace PerfView
         {
             m_formatName = formatName;
             m_fileExtensions = fileExtensions;
+            m_Children = new List<PerfViewTreeItem>();
         }
 
         public override string FormatName { get { return m_formatName; } }
@@ -1137,7 +1147,7 @@ namespace PerfView
 
                 worker.EndWork(delegate ()
                 {
-                    Process.Start(reportFileName);
+                    System.Diagnostics.Process.Start(reportFileName);
                 });
             });
         }
@@ -1525,14 +1535,30 @@ table {
 
     public class AutomatedAnalysisReport : PerfViewHtmlReport
     {
-        public AutomatedAnalysisReport(PerfViewFile dataFile) : base(dataFile, "Automatic CPU Analysis") { }
+        public AutomatedAnalysisReport(PerfViewFile dataFile) : base(dataFile, "Automated Trace Analysis") { }
 
         protected override void WriteHtmlBody(TraceLog dataFile, TextWriter writer, string fileName, TextWriter log)
         {
-            AutomatedAnalysisManager manager = new AutomatedAnalysisManager();
+            string analyzersDirectory = Path.Combine(SupportFiles.SupportFileDir, "Analyzers");
+            DirectoryAnalyzerResolver resolver = new DirectoryAnalyzerResolver(analyzersDirectory);
+            TraceProcessor traceProcessor = new TraceProcessor(resolver);
             AutomatedAnalysisTraceLog traceLog = new AutomatedAnalysisTraceLog(dataFile, App.GetSymbolReader(dataFile.FilePath));
-            AutomatedAnalysisResult result = manager.ProcessTrace(traceLog, log);
-            result.GenerateReport(writer);
+            TraceProcessorResult result = traceProcessor.ProcessTrace(traceLog);
+
+            using (HtmlReportGenerator reportGenerator = new HtmlReportGenerator(writer))
+            {
+                // Write out issues.
+                foreach (KeyValuePair<Microsoft.Diagnostics.Tracing.AutomatedAnalysis.Process, List<AnalyzerIssue>> pair in result.Issues)
+                {
+                    if (pair.Value.Count > 0)
+                    {
+                        reportGenerator.WriteIssuesForProcess(pair.Key, pair.Value);
+                    }
+                }
+
+                // Write the list of executed analyzers.
+                reportGenerator.WriteExecutedAnalyzerList(result.ExecutedAnalyzers);
+            }
         }
     }
 
@@ -2857,13 +2883,13 @@ table {
                     {
                         var byTimeState = byTimeStats[idx];
                         byTimeState.NumRequests++;
-                        byTimeState.DurationMSecTotal += (float)request.DurationMSec;
-                        byTimeState.QueuedDurationMSecTotal += (float)request.QueueDurationMSec;
-                        if ((float)request.DurationMSec > byTimeState.RequestsMSecMax)
+                        byTimeState.DurationMSecTotal += request.DurationMSec;
+                        byTimeState.QueuedDurationMSecTotal += request.QueueDurationMSec;
+                        if (request.DurationMSec > byTimeState.RequestsMSecMax)
                         {
                             byTimeState.RequestsThreadOfMax = request.HandlerThreadID;
                             byTimeState.RequestsTimeOfMax = request.StartTimeRelativeMSec;
-                            byTimeState.RequestsMSecMax = (float)request.DurationMSec;
+                            byTimeState.RequestsMSecMax = request.DurationMSec;
                         }
                     }
                 }
@@ -3243,26 +3269,26 @@ table {
             public int ContextSwitch;
             public double DiskIOMsec;         // The amount of Disk service time (all disks, machine wide).  
 
-            public float RequestsMSecMax;
+            public double RequestsMSecMax;
             public double RequestsTimeOfMax;
             public int RequestsThreadOfMax;
 
-            public float DurationMSecTotal;
-            public float QueuedDurationMSecTotal;
+            public double DurationMSecTotal;
+            public double QueuedDurationMSecTotal;
 
             public int ThreadPoolThreadCountSum;
             public int ThreadPoolAdjustmentCount;
-            public float MeanThreadPoolThreads { get { return (float)ThreadPoolThreadCountSum / ThreadPoolAdjustmentCount; } }
+            public double MeanThreadPoolThreads { get { return (double)ThreadPoolThreadCountSum / ThreadPoolAdjustmentCount; } }
 
-            public float GCHeapAllocMB;
-            public float GCHeapSizeMB;
-            public float NumGcs;
-            public float NumGen2Gcs;
+            public double GCHeapAllocMB;
+            public double GCHeapSizeMB;
+            public double NumGcs;
+            public double NumGen2Gcs;
             public int Contentions;
             public int MinRequestsQueued;
-            public float MeanRequestsProcessing { get { return MeanRequestsProcessingSum / MeanRequestsProcessingCount; } }
+            public double MeanRequestsProcessing { get { return MeanRequestsProcessingSum / MeanRequestsProcessingCount; } }
 
-            internal float MeanRequestsProcessingSum;
+            internal double MeanRequestsProcessingSum;
             internal int MeanRequestsProcessingCount;
         };
 
@@ -3519,7 +3545,7 @@ table {
                 Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.NeedLoadedDotNetRuntimes(source);
                 Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.AddCallbackOnProcessStart(source, proc =>
                 {
-                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, (float)dataFile.SampleProfileInterval.TotalMilliseconds);
+                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, dataFile.SampleProfileInterval.TotalMilliseconds);
                     proc.Log = dataFile;
                 });
                 source.Process();
@@ -3730,6 +3756,29 @@ table {
         private Dictionary<int /*pid*/, List<object>> m_bgJitEvents;
     }
 
+    public class PerfViewFileVersionStats : PerfViewHtmlReport
+    {
+        public PerfViewFileVersionStats(PerfViewFile dataFile) : base(dataFile, "Module Version Information") { }
+
+        protected override void WriteHtmlBody(TraceLog dataFile, TextWriter output, string fileName, TextWriter log)
+        {
+            Dictionary<int, Microsoft.Diagnostics.Tracing.Analysis.TraceProcess> processes = new Dictionary<int, Microsoft.Diagnostics.Tracing.Analysis.TraceProcess>();
+            var source = dataFile.Events.GetSource();
+
+            Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.NeedLoadedDotNetRuntimes(source);
+            source.Process();
+            foreach (var proc in Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.Processes(source))
+            {
+                if (Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.LoadedDotNetRuntime(proc) != null && !processes.ContainsKey(proc.ProcessID))
+                {
+                    processes.Add(proc.ProcessID, proc);
+                }
+            }
+
+            Stats.ClrStats.ToHtml(output, processes.Values.ToList(), fileName, "Module Version Information", Stats.ClrStats.ReportType.FileVersion, true, traceLog: dataFile);
+        }
+    }
+
     /// <summary>
     /// Represents all the heap snapshots in the trace
     /// </summary>
@@ -3772,7 +3821,7 @@ table {
                     // For .NET, we are looking for a Gen 2 GC Start that is induced that has GCBulkNodes after it.   
                     var lastGCStartsRelMSec = new Dictionary<int, double>();
 
-                    source.Clr.GCGenAwareStart += delegate (Microsoft.Diagnostics.Tracing.Parsers.Clr.GenAwareBeginTraceData data)
+                    source.Clr.GCGenAwareBegin += delegate (Microsoft.Diagnostics.Tracing.Parsers.Clr.GenAwareTemplateTraceData data)
                     {
                         lastGCStartsRelMSec[data.ProcessID] = data.TimeStampRelativeMSec;
                     };
@@ -4160,7 +4209,7 @@ table {
             if (!m_WarnedAboutBrokenStacks)
             {
                 m_WarnedAboutBrokenStacks = true;
-                float brokenPercent = Viewer.CallTree.Root.GetBrokenStackCount() * 100 / Viewer.CallTree.Root.InclusiveCount;
+                double brokenPercent = Viewer.CallTree.Root.GetBrokenStackCount() * 100 / Viewer.CallTree.Root.InclusiveCount;
                 if (brokenPercent > 0)
                 {
                     bool is64bit = false;
@@ -4177,7 +4226,7 @@ table {
             }
             return false;
         }
-        private static bool WarnAboutBrokenStacks(Window parentWindow, float brokenPercent, bool is64Bit, TextWriter log)
+        private static bool WarnAboutBrokenStacks(Window parentWindow, double brokenPercent, bool is64Bit, TextWriter log)
         {
             if (brokenPercent > 1)
             {
@@ -4421,7 +4470,7 @@ table {
 
                     newHeap.OnGC += delegate (double time, int gen)
                     {
-                        sample.Metric = float.Epsilon;
+                        sample.Metric = double.Epsilon;
                         sample.Count = 1;
                         sample.TimeRelativeMSec = time;
                         StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
@@ -4459,7 +4508,7 @@ table {
 
                     newHeap.OnGC += delegate (double time, int gen)
                     {
-                        sample.Metric = float.Epsilon;
+                        sample.Metric = double.Epsilon;
                         sample.Count = 1;
                         sample.TimeRelativeMSec = time;
                         StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
@@ -5379,7 +5428,13 @@ table {
                         var frameIdx = stackSource.Interner.FrameIntern("EventData Kind " + asAllocTick.AllocationKind);
                         stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
 
-                        frameIdx = stackSource.Interner.FrameIntern("EventData Size " + asAllocTick.AllocationAmount64);
+                        if (data.Version >= 4)
+                        {
+                            frameIdx = stackSource.Interner.FrameIntern("EventData ObjectSize " + asAllocTick.ObjectSize);
+                            stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
+                        }
+
+                        frameIdx = stackSource.Interner.FrameIntern("EventData AllocationSize " + asAllocTick.AllocationAmount64);
                         stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
 
                         var typeName = asAllocTick.TypeName;
@@ -5392,6 +5447,16 @@ table {
                         stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
                         goto ADD_EVENT_FRAME;
                     }
+
+                    var asTaskWaitSend = data as TaskWaitSendArgs;
+                    if (asTaskWaitSend != null)
+                    {
+                        var frameIdx = stackSource.Interner.FrameIntern("EventData Behavior " + asTaskWaitSend.Behavior);
+                        stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
+                        
+                        goto ADD_EVENT_FRAME;
+                    }
+
 
                     var asSampleObjectAllocated = data as GCSampledObjectAllocationTraceData;
                     if (asSampleObjectAllocated != null)
@@ -5490,11 +5555,11 @@ table {
                         }
                     }
 
-                    ADD_EVENT_FRAME:
+                ADD_EVENT_FRAME:
                     // Tack on event name 
                     var eventNodeName = "Event " + data.ProviderName + "/" + data.EventName;
                     stackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(eventNodeName), stackIndex);
-                    ADD_SAMPLE:
+                ADD_SAMPLE:
                     sample.StackIndex = stackIndex;
                     sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
                     sample.Metric = 1;
@@ -5574,14 +5639,14 @@ table {
 
                         var queueStackIdx = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern("Time in Disk Queue " + diskNumber), stackIdx);
                         sample.StackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(nodeName), queueStackIdx);
-                        sample.Metric = (float)(elapsedMSec - serviceTimeMSec);
+                        sample.Metric = elapsedMSec - serviceTimeMSec;
                         sample.TimeRelativeMSec = data.TimeStampRelativeMSec - elapsedMSec;
                         stackSource.AddSample(sample);
                     }
 
                     stackIdx = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern("Service Time Disk " + diskNumber), stackIdx);
                     sample.StackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(nodeName), stackIdx);
-                    sample.Metric = (float)serviceTimeMSec;
+                    sample.Metric = serviceTimeMSec;
                     sample.TimeRelativeMSec = data.TimeStampRelativeMSec - serviceTimeMSec;
                     stackSource.AddSample(sample);
                 });
@@ -5604,6 +5669,18 @@ table {
             {
                 ServerRequestScenarioConfiguration scenarioConfiguration = new ServerRequestScenarioConfiguration(eventLog);
                 ComputingResourceStateMachine stateMachine = new ComputingResourceStateMachine(stackSource, scenarioConfiguration, ComputingResourceViewType.Allocations);
+                stateMachine.Execute();
+            }
+            else if (streamName == "UserCrit Held CPU")
+            {
+                UserCritScenarioConfiguration scenarioConfiguration = new UserCritScenarioConfiguration(eventLog);
+                ComputingResourceStateMachine stateMachine = new ComputingResourceStateMachine(stackSource, scenarioConfiguration, ComputingResourceViewType.CPU);
+                stateMachine.Execute();
+            }
+            else if (streamName == "UserCrit Held ThreadTime")
+            {
+                UserCritScenarioConfiguration scenarioConfiguration = new UserCritScenarioConfiguration(eventLog);
+                ComputingResourceStateMachine stateMachine = new ComputingResourceStateMachine(stackSource, scenarioConfiguration, ComputingResourceViewType.ThreadTime);
                 stateMachine.Execute();
             }
             else if (streamName == "Execution Tracing")
@@ -5688,7 +5765,7 @@ table {
             {
                 eventSource.Kernel.AddCallbackForEvents<FileIOReadWriteTraceData>(delegate (FileIOReadWriteTraceData data)
                 {
-                    sample.Metric = (float)data.IoSize;
+                    sample.Metric = data.IoSize;
                     sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
 
                     StackSourceCallStackIndex stackIdx = stackSource.GetCallStack(data.CallStackIndex(), data);
@@ -5964,10 +6041,10 @@ table {
 
                 Address lastHeapHandle = 0;
 
-                float peakMetric = 0;
+                double peakMetric = 0;
                 StackSourceSample peakSample = null;
-                float cumMetric = 0;
-                float sumCumMetric = 0;
+                double cumMetric = 0;
+                double sumCumMetric = 0;
                 int cumCount = 0;
 
                 heapParser.HeapTraceAlloc += delegate (HeapAllocTraceData data)
@@ -6164,13 +6241,13 @@ table {
                 Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.NeedLoadedDotNetRuntimes(eventSource);
                 Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.AddCallbackOnProcessStart(eventSource, proc =>
                 {
-                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, (float)eventLog.SampleProfileInterval.TotalMilliseconds);
+                    Microsoft.Diagnostics.Tracing.Analysis.TraceProcessesExtensions.SetSampleIntervalMSec(proc, eventLog.SampleProfileInterval.TotalMilliseconds);
                     Microsoft.Diagnostics.Tracing.Analysis.TraceLoadedDotNetRuntimeExtensions.SetMutableTraceEventStackSource(proc, stackSource);
                 });
                 eventSource.Process();
                 return stackSource;
             }
-            else if(streamName == "Anti-Malware Real-Time Scan")
+            else if (streamName == "Anti-Malware Real-Time Scan")
             {
                 RealtimeAntimalwareComputer computer = new RealtimeAntimalwareComputer(eventSource, stackSource);
                 computer.Execute();
@@ -6316,7 +6393,7 @@ table {
         private static void LogGCHandleLifetime(MutableTraceEventStackSource stackSource,
             StackSourceSample sample, GCHandleInfo info, double timeRelativeMSec, TextWriter log)
         {
-            sample.Metric = (float)(timeRelativeMSec - info.PinStartTimeRelativeMSec);
+            sample.Metric = timeRelativeMSec - info.PinStartTimeRelativeMSec;
             if (sample.Metric < 0)
             {
                 log.WriteLine("Error got a negative time at {0:n3} started {1:n3}.  Dropping", timeRelativeMSec, info.PinStartTimeRelativeMSec);
@@ -7011,6 +7088,7 @@ table {
             var advanced = new PerfViewTreeGroup("Advanced");
             var memory = new PerfViewTreeGroup("Memory");
             var frameworkAspNetWcf = new PerfViewTreeGroup(".NET Framework ASP.NET/WCF");
+            var ui = new PerfViewTreeGroup("UI");
             var experimental = new PerfViewTreeGroup("Experimental");
             m_Children = new List<PerfViewTreeItem>();
 
@@ -7046,6 +7124,7 @@ table {
             bool hasTypeLoad = false;
             bool hasAssemblyLoad = false;
             bool hasJIT = false;
+            bool hasUserCrit = false;
 
             var stackEvents = new List<TraceEventCounts>();
             foreach (var counts in tracelog.Stats)
@@ -7117,6 +7196,10 @@ table {
                 if (name.StartsWith("Loader/AssemblyLoad"))
                 {
                     hasAssemblyLoad = true;
+                }
+                if (name.EndsWith("UserCrit"))
+                {
+                    hasUserCrit = true;
                 }
 
                 if (counts.StackCount > 0)
@@ -7236,9 +7319,9 @@ table {
             {
                 if (hasTplStacks)
                 {
-                    advanced.Children.Add(new PerfViewStackSource(this, "Thread Time"));
+                    m_Children.Add(new PerfViewStackSource(this, "Thread Time"));
                     advanced.Children.Add(new PerfViewStackSource(this, "Thread Time (with Tasks)"));
-                    m_Children.Add(new PerfViewStackSource(this, "Thread Time (with StartStop Activities)"));
+                    advanced.Children.Add(new PerfViewStackSource(this, "Thread Time (with StartStop Activities)"));
                 }
                 else
                 {
@@ -7318,7 +7401,7 @@ table {
                 advanced.Children.Add(new PerfViewStackSource(this, "Pinning At GC Time"));
             }
 
-            if (hasGCEvents && hasCPUStacks && AppLog.InternalUser)
+            if (hasGCEvents && hasCPUStacks)
             {
                 memory.Children.Add(new PerfViewStackSource(this, "Server GC"));
             }
@@ -7345,6 +7428,19 @@ table {
                 {
                     advanced.Children.Add(new PerfViewStackSource(this, "Heap Snapshot Pinning"));
                     advanced.Children.Add(new PerfViewStackSource(this, "Heap Snapshot Pinned Object Allocation"));
+                }
+            }
+
+            if (hasUserCrit)
+            {
+                if (hasCPUStacks)
+                {
+                    ui.Children.Add(new PerfViewStackSource(this, "UserCrit Held CPU"));
+                }
+
+                if (hasCSwitchStacks)
+                {
+                    ui.Children.Add(new PerfViewStackSource(this, "UserCrit Held ThreadTime"));
                 }
             }
 
@@ -7403,7 +7499,7 @@ table {
                 advanced.Children.Add(new PerfViewIisStats(this));
             }
 
-            if (hasProjectNExecutionTracingEvents && AppLog.InternalUser)
+            if (hasProjectNExecutionTracingEvents)
             {
                 advanced.Children.Add(new PerfViewStackSource(this, "Execution Tracing"));
             }
@@ -7415,11 +7511,7 @@ table {
 
             memory.Children.Add(new PerfViewGCStats(this));
 
-            // TODO currently this is experimental enough that we don't show it publicly.  
-            if (AppLog.InternalUser)
-            {
-                memory.Children.Add(new MemoryAnalyzer(this));
-            }
+            memory.Children.Add(new MemoryAnalyzer(this));
 
             if (hasJSHeapDumps || hasDotNetHeapDumps)
             {
@@ -7434,6 +7526,7 @@ table {
             }
 
             advanced.Children.Add(new PerfViewEventStats(this));
+            advanced.Children.Add(new PerfViewFileVersionStats(this));
 
             m_Children.Add(new PerfViewEventSource(this));
 
@@ -7452,7 +7545,12 @@ table {
                 m_Children.Add(frameworkAspNetWcf);
             }
 
-            if (AppLog.InternalUser && 0 < experimental.Children.Count)
+            if (0 < ui.Children.Count)
+            {
+                m_Children.Add(ui);
+            }
+
+            if (0 < experimental.Children.Count)
             {
                 m_Children.Add(experimental);
             }
@@ -7823,6 +7921,8 @@ table {
         protected internal override void ConfigureStackWindow(string stackSourceName, StackWindow stackWindow)
         {
             stackWindow.RestoreWindow(m_guiState, FilePath);
+            stackWindow.GroupRegExTextBox.Items.Add(@"[group modules]           {%}!->module $1");
+            stackWindow.GroupRegExTextBox.Items.Add(@"[group module entries]  {%}!=>module $1");
         }
         protected internal override void FirstAction(StackWindow stackWindow)
         {
@@ -8424,63 +8524,15 @@ table {
                    graph.SizeOfGraphDescription() / 1000000.0);
         }
 
-        /// <summary>
-        /// These hold stacks which we know they either have an '[not reachable from roots]' or not
-        /// </summary>
-        private struct UnreachableCacheEntry
-        {
-            public StackSourceCallStackIndex stack;
-            public bool unreachable;
-            public bool valid;
-        };
-
-        /// <summary>
-        /// Returns true if 'stackIdx' is reachable from the roots (that is, it does not have '[not reachable from roots]' as one
-        /// of its parent nodes.    'cache' is simply an array used to speed up this process because it remembers the answers for
-        /// nodes up the stack that are likely to be used for the next index.   
-        /// </summary>
-        private static bool IsUnreachable(StackSource memoryStackSource, StackSourceCallStackIndex stackIdx, UnreachableCacheEntry[] cache, int depth)
-        {
-            if (stackIdx == StackSourceCallStackIndex.Invalid)
-            {
-                return false;
-            }
-
-            int entryIdx = ((int)stackIdx) % cache.Length;
-            UnreachableCacheEntry entry = cache[entryIdx];
-            if (stackIdx != entry.stack || !entry.valid)
-            {
-                var callerIdx = memoryStackSource.GetCallerIndex(stackIdx);
-                if (callerIdx == StackSourceCallStackIndex.Invalid)
-                {
-                    var frameIdx = memoryStackSource.GetFrameIndex(stackIdx);
-                    var name = memoryStackSource.GetFrameName(frameIdx, false);
-                    entry.unreachable = string.Compare(name, "[not reachable from roots]", StringComparison.OrdinalIgnoreCase) == 0;
-                }
-                else
-                {
-                    entry.unreachable = IsUnreachable(memoryStackSource, callerIdx, cache, depth + 1);
-                }
-
-                entry.stack = stackIdx;
-                entry.valid = true;
-                cache[entryIdx] = entry;
-            }
-            return entry.unreachable;
-        }
-
-        private static void ComputeUnreachableMemory(StackSource memoryStackSource, out double unreachableMemoryRet, out double totalMemoryRet)
+        private static void ComputeUnreachableMemory(MemoryGraphStackSource memoryStackSource, out double unreachableMemoryRet, out double totalMemoryRet)
         {
             double unreachableMemory = 0;
             double totalMemory = 0;
 
-            // Make the cache roughly hit every 7 tries.  This keeps memory under control for large heaps
-            // but the slowdown because of misses will not be too bad.  
-            var cache = new UnreachableCacheEntry[memoryStackSource.SampleIndexLimit / 7 + 1001];
-            memoryStackSource.ForEach(delegate (StackSourceSample sample)
+            memoryStackSource.ForEachUnordered(delegate (StackSourceSample sample, bool reachable)
             {
                 totalMemory += sample.Metric;
-                if (IsUnreachable(memoryStackSource, sample.StackIndex, cache, 0))
+                if (!reachable)
                 {
                     unreachableMemory += sample.Metric;
                 }
@@ -8628,7 +8680,7 @@ table {
                 m_Children.Add(advanced);
             }
 
-            if(AppLog.InternalUser && experimental.Children.Count > 0)
+            if(experimental.Children.Count > 0)
             {
                 m_Children.Add(experimental);
             }
@@ -8937,7 +8989,13 @@ table {
                                     var frameIdx = stackSource.Interner.FrameIntern("EventData Kind " + asAllocTick.AllocationKind);
                                     stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
 
-                                    frameIdx = stackSource.Interner.FrameIntern("EventData Size " + asAllocTick.AllocationAmount64);
+                                    if (data.Version >= 4)
+                                    {
+                                        frameIdx = stackSource.Interner.FrameIntern("EventData ObjectSize " + asAllocTick.ObjectSize);
+                                        stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
+                                    }
+
+                                    frameIdx = stackSource.Interner.FrameIntern("EventData AllocationSize " + asAllocTick.AllocationAmount64);
                                     stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
 
                                     var typeName = asAllocTick.TypeName;
@@ -8948,6 +9006,15 @@ table {
 
                                     frameIdx = stackSource.Interner.FrameIntern("EventData TypeName " + typeName);
                                     stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
+                                    goto ADD_EVENT_FRAME;
+                                }
+                                
+                                var asTaskWaitSend = data as TaskWaitSendArgs;
+                                if (asTaskWaitSend != null)
+                                {
+                                    var frameIdx = stackSource.Interner.FrameIntern("EventData Behavior " + asTaskWaitSend.Behavior);
+                                    stackIndex = stackSource.Interner.CallStackIntern(frameIdx, stackIndex);
+                        
                                     goto ADD_EVENT_FRAME;
                                 }
 
@@ -9043,7 +9110,7 @@ table {
 
                                 newHeap.OnGC += delegate (double time, int gen)
                                 {
-                                    sample.Metric = float.Epsilon;
+                                    sample.Metric = double.Epsilon;
                                     sample.Count = 1;
                                     sample.TimeRelativeMSec = time;
                                     StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
@@ -9081,7 +9148,7 @@ table {
 
                                 newHeap.OnGC += delegate (double time, int gen)
                                 {
-                                    sample.Metric = float.Epsilon;
+                                    sample.Metric = double.Epsilon;
                                     sample.Count = 1;
                                     sample.TimeRelativeMSec = time;
                                     StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
@@ -9548,7 +9615,7 @@ table {
     public class ProcessDumpPerfViewFile : PerfViewFile
     {
         public override string FormatName { get { return "Process Dump"; } }
-        public override string[] FileExtensions { get { return new string[] { ".dmp" }; } }
+        public override string[] FileExtensions { get { return new string[] { ".dmp", ".hdmp" }; } }
 
         public override void Open(Window parentWindow, StatusBar worker, Action doAfter = null)
         {
@@ -9934,22 +10001,20 @@ table {
                     {
                         // The directories contained in the symbol cache resource _are_ in the symbol cache format
                         // which means directories are in the form of /<file.ext>/<hash>/file.ext so in this case
-                        // we use the GetFileName API since it will consider the dictory name a file name.
+                        // we use the GetFileName API since it will consider the directory name a file name.
                         var targetDir = Path.Combine(symbolCachePath, Path.GetFileName(subPath));
 
-                        if (!Directory.Exists(targetDir))
+                        // The directory exists, so we must merge the two cache directories
+                        foreach (var symbolVersionDir in Directory.EnumerateDirectories(subPath))
                         {
-                            Directory.Move(subPath, targetDir);
-                        }
-                        else
-                        {
-                            // The directory exists, so we must merge the two cache directories
-                            foreach (var symbolVersionDir in Directory.EnumerateDirectories(subPath))
+                            var targetVersionDir = Path.Combine(targetDir, Path.GetFileName(symbolVersionDir));
+                            if (!Directory.Exists(targetVersionDir))
                             {
-                                var targetVersionDir = Path.Combine(targetDir, Path.GetFileName(symbolVersionDir));
-                                if (!Directory.Exists(targetVersionDir))
+                                Directory.CreateDirectory(targetVersionDir);
+                                foreach (var symbolFilePath in Directory.EnumerateFiles(symbolVersionDir))
                                 {
-                                    Directory.Move(symbolVersionDir, targetVersionDir);
+                                    string targetFilePath = Path.Combine(targetVersionDir, Path.GetFileName(symbolFilePath));
+                                    File.Move(symbolFilePath, Path.Combine(symbolFilePath, targetFilePath));
                                 }
                             }
                         }
@@ -10028,6 +10093,64 @@ table {
             }
 
             return newResources;
+        }
+    }
+
+    public partial class StracePerfViewData : PerfViewFile
+    {
+        private string[] StreamNames = new string[]
+        {
+            "Syscalls",
+        };
+
+        public override string FormatName { get { return "strace"; } }
+
+        public override string[] FileExtensions { get { return new string[] { ".strace" }; } }
+
+        public override bool SupportsProcesses => false;
+
+        protected internal override StackSource OpenStackSourceImpl(string streamName, TextWriter log, double startRelativeMSec = 0, double endRelativeMSec = double.PositiveInfinity, Predicate<TraceEvent> predicate = null)
+        {
+            if (StreamNames.Contains(streamName))
+            {
+                string xmlPath;
+
+                xmlPath = CacheFiles.FindFile(FilePath, $"{streamName}.strace.xml.zip");
+
+#if !DEBUG
+                if (!CacheFiles.UpToDate(xmlPath, FilePath))
+#endif
+                {
+                    XmlStackSourceWriter.WriteStackViewAsZippedXml(
+                        new StraceStackSource(FilePath), xmlPath);
+                }
+
+                return new XmlStackSource(xmlPath, null);
+            }
+
+            return null;
+        }
+
+        protected override Action<Action> OpenImpl(Window parentWindow, StatusBar worker)
+        {
+            m_Children = new List<PerfViewTreeItem>()
+            {
+                new PerfViewStackSource(this, "Syscalls"),
+            };
+
+            return null;
+        }
+
+        public override ImageSource Icon { get { return GuiApp.MainWindow.Resources["FileBitmapImage"] as ImageSource; } }
+
+        protected internal override void ConfigureStackWindow(string stackSourceName, StackWindow stackWindow)
+        {
+            stackWindow.ScalingPolicy = ScalingPolicyKind.TimeMetric;
+            stackWindow.GroupRegExTextBox.Text = stackWindow.GetDefaultGroupPat();
+
+            stackWindow.CallTreeTab.IsSelected = true;      // start with the call tree view
+
+            ConfigureGroupRegExTextBox(stackWindow, windows: false);
         }
     }
 }

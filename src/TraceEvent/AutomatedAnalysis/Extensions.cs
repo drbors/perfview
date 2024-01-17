@@ -1,12 +1,13 @@
 ﻿using System;
 using System.Linq;
+using Microsoft.Diagnostics.Symbols;
 using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Stacks;
 
 namespace Microsoft.Diagnostics.Tracing.AutomatedAnalysis
 {
-    public static class Extensions
+    internal static class Extensions
     {
         public static StackSource CPUStacks(this TraceLog eventLog, TraceProcess process = null, Predicate<TraceEvent> predicate = null)
         {
@@ -26,12 +27,26 @@ namespace Microsoft.Diagnostics.Tracing.AutomatedAnalysis
             return CopyStackSource.Clone(traceStackSource);
         }
 
+        public static MutableTraceEventStackSource BlockedTimeStacks(this TraceLog eventLog, SymbolReader symbolReader)
+        {
+            var stackSource = new MutableTraceEventStackSource(eventLog);
+
+            var computer = new ThreadTimeStackComputer(eventLog, symbolReader);
+            computer.ExcludeReadyThread = true;
+            computer.BlockedTimeOnly = true;
+            computer.GenerateThreadTimeStacks(stackSource);
+
+            return stackSource;
+        }
+
         public static bool ManagedProcess(this TraceProcess process)
         {
-            return process.LoadedModules.Where(module =>
+            return process.LoadedModules.Any(module =>
+                    module is TraceManagedModule ||
                     module.Name.Equals("clr", StringComparison.OrdinalIgnoreCase) ||
                     module.Name.Equals("coreclr", StringComparison.OrdinalIgnoreCase) ||
-                    module.Name.Equals("mscorwks", StringComparison.OrdinalIgnoreCase)).Count() > 0;
+                    module.Name.Equals("mscorwks", StringComparison.OrdinalIgnoreCase) ||
+                    module.Name.Equals("System.Private.CoreLib", StringComparison.OrdinalIgnoreCase));
         }
     }
 }

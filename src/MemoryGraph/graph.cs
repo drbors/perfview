@@ -81,7 +81,7 @@ namespace Graphs
         /// returns true if SetNode has been called on this node (it is not an undefined object).  
         /// TODO FIX NOW used this instead of the weird if node index grows technique. 
         /// </summary>
-        public bool IsDefined(NodeIndex nodeIndex) { return m_nodes[(int)nodeIndex] != m_undefinedObjDef; }
+        public bool IsDefined(NodeIndex nodeIndex) { return (StreamLabel)m_nodes[(int)nodeIndex] != m_undefinedObjDef; }
         /// <summary>
         /// Given an arbitrary code:NodeTypeIndex that identifies the nodeId of the node, Get a code:NodeType object.  
         /// 
@@ -168,7 +168,7 @@ namespace Graphs
             m_isVeryLargeGraph = isVeryLargeGraph;
             m_expectedNodeCount = expectedNodeCount;
             m_types = new GrowableArray<TypeInfo>(Math.Max(expectedNodeCount / 100, 2000));
-            m_nodes = new SegmentedList<StreamLabel>(SegmentSize, m_expectedNodeCount);
+            m_nodes = new SegmentedList<nuint>(SegmentSize, m_expectedNodeCount);
             RootIndex = NodeIndex.Invalid;
             ClearWorker();
         }
@@ -202,23 +202,69 @@ namespace Graphs
         public virtual NodeIndex CreateNode()
         {
             var ret = (NodeIndex)m_nodes.Count;
-            m_nodes.Add(m_undefinedObjDef);
+            m_nodes.Add((nuint)m_undefinedObjDef);
             return ret;
         }
+
+        /// <summary>
+        /// Provides a temporary buffer to sort children in <see cref="SetNode"/>.
+        /// </summary>
+        [ThreadStatic]
+        private static NodeIndex[] s_sortedChildrenBuffer;
+
         /// <summary>
         /// Sets the information associated with the node at 'nodeIndex' (which was created via code:CreateNode).  Nodes
         /// have a nodeId, Size and children.  (TODO: should Size be here?)
         /// </summary>
-        public void SetNode(NodeIndex nodeIndex, NodeTypeIndex typeIndex, int sizeInBytes, GrowableArray<NodeIndex> children)
+        public void SetNode(NodeIndex nodeIndex, NodeTypeIndex typeIndex, int sizeInBytes, HashSet<NodeIndex> children)
         {
             SetNodeTypeAndSize(nodeIndex, typeIndex, sizeInBytes);
+
+            var sortedChildren = SortChildren(children);
 
             Node.WriteCompressedInt(m_writer, children.Count);
             for (int i = 0; i < children.Count; i++)
             {
-                Node.WriteCompressedInt(m_writer, (int)children[i] - (int)nodeIndex);
+                var child = sortedChildren[i];
+                Node.WriteCompressedInt(m_writer, (int)child - (int)nodeIndex);
             }
             m_totalRefs += children.Count;
+        }
+
+        private static NodeIndex[] SortChildren(HashSet<NodeIndex> children)
+        {
+            NodeIndex[] sortedChildren;
+            if (children.Count > 1024)
+            {
+                // Avoid large thread-static allocations that never get garbage collected
+                sortedChildren = new NodeIndex[children.Count];
+            }
+            else
+            {
+                if (s_sortedChildrenBuffer is null)
+                {
+                    s_sortedChildrenBuffer = new NodeIndex[children.Count];
+                }
+                else if (s_sortedChildrenBuffer.Length < children.Count)
+                {
+                    Array.Resize(ref s_sortedChildrenBuffer, children.Count);
+                }
+
+                sortedChildren = s_sortedChildrenBuffer;
+            }
+
+            children.CopyTo(sortedChildren);
+            Array.Sort(sortedChildren, 0, children.Count, NodeIndexComparer.Instance);
+            return sortedChildren;
+        }
+
+        private sealed class NodeIndexComparer : Comparer<NodeIndex>
+        {
+            public static readonly NodeIndexComparer Instance = new NodeIndexComparer();
+            public override int Compare(NodeIndex x, NodeIndex y)
+            {
+                return x - y;
+            }
         }
 
         /// <summary>
@@ -417,8 +463,8 @@ namespace Graphs
 
         internal void SetNodeTypeAndSize(NodeIndex nodeIndex, NodeTypeIndex typeIndex, int sizeInBytes)
         {
-            Debug.Assert(m_nodes[(int)nodeIndex] == m_undefinedObjDef, "Calling SetNode twice for node index " + nodeIndex);
-            m_nodes[(int)nodeIndex] = m_writer.GetLabel();
+            Debug.Assert((StreamLabel)m_nodes[(int)nodeIndex] == m_undefinedObjDef, "Calling SetNode twice for node index " + nodeIndex);
+            m_nodes[(int)nodeIndex] = (nuint)m_writer.GetLabel();
 
             Debug.Assert(sizeInBytes >= 0);
             // We are going to assume that if this is negative it is because it is a large positive number.  
@@ -465,7 +511,7 @@ namespace Graphs
             RootIndex = NodeIndex.Invalid;
             if (m_writer == null)
             {
-                m_writer = new SegmentedMemoryStreamWriter(m_expectedNodeCount * 8,
+                m_writer = new MemoryMappedFileStreamWriter(m_expectedNodeCount * 8,
                     m_isVeryLargeGraph ? new SerializationConfiguration() { StreamLabelWidth = StreamLabelWidth.EightBytes } : null);
             }
 
@@ -478,9 +524,9 @@ namespace Graphs
             // Create an undefined node, kind of gross because SetNode expects to have an entry
             // in the m_nodes table, so we make a fake one and then remove it.  
             m_undefinedObjDef = m_writer.GetLabel();
-            m_nodes.Add(m_undefinedObjDef);
-            SetNode(0, CreateType("UNDEFINED"), 0, new GrowableArray<NodeIndex>());
-            Debug.Assert(m_nodes[0] == m_undefinedObjDef);
+            m_nodes.Add((nuint)m_undefinedObjDef);
+            SetNode(0, CreateType("UNDEFINED"), 0, new HashSet<NodeIndex>());
+            Debug.Assert((StreamLabel)m_nodes[0] == m_undefinedObjDef);
             m_nodes.Count = 0;
         }
 
@@ -504,16 +550,41 @@ namespace Graphs
         {
             serializer.Write(m_totalSize);
             serializer.Write((int)RootIndex);
-            // Write out the Types 
+
+            // Write out the module names for types
+            var moduleNames = new Dictionary<string, int>();
+            foreach (var type in m_types)
+            {
+                if (type.ModuleName is null)
+                    continue;
+
+                if (!moduleNames.ContainsKey(type.ModuleName))
+                {
+                    // Index 0 is implicitly null, so start with 1 for the first non-null value
+                    moduleNames.Add(type.ModuleName, moduleNames.Count + 1);
+                }
+            }
+
+            serializer.Write(moduleNames.Count);
+            foreach (var pair in moduleNames)
+            {
+                // Dictionary<TKey, TValue> iterates in insertion order
+                serializer.Write(pair.Key);
+            }
+
+            // Write out the Types
             serializer.Write(m_types.Count);
             for (int i = 0; i < m_types.Count; i++)
             {
                 serializer.Write(m_types[i].Name);
                 serializer.Write(m_types[i].Size);
-                serializer.Write(m_types[i].ModuleName);
+                if (m_types[i].ModuleName is null)
+                    serializer.Write(0);
+                else
+                    serializer.Write(moduleNames[m_types[i].ModuleName]);
             }
 
-            // Write out the Nodes
+            // Write out the Nodes 
             if (m_isVeryLargeGraph)
             {
                 serializer.Write(m_nodes.Count);
@@ -523,19 +594,28 @@ namespace Graphs
                 serializer.Write((int)m_nodes.Count);
             }
 
-            for (int i = 0; i < m_nodes.Count; i++)
+            nuint previousLabel = 0;
+            for (long i = 0; i < m_nodes.Count; i++)
             {
-                serializer.Write((int)m_nodes[i]);
+                // Apply differential compression to the label, and then write it as a compressed integer
+                nuint currentLabel = m_nodes[i];
+                long difference = currentLabel >= previousLabel ? checked((long)(currentLabel - previousLabel)) : checked(-(long)(previousLabel - currentLabel));
+                Node.WriteCompressedInt64(serializer.Writer, difference);
+                previousLabel = currentLabel;
             }
 
-            // Write out the Blob stream.  
-            // TODO this is inefficient.  Also think about very large files.  
-            int readerLen = (int)m_reader.Length;
+            // Write out the Blob stream.
+            long readerLen = m_reader.Length;
             serializer.Write(readerLen);
             m_reader.Goto((StreamLabel)0);
-            for (uint i = 0; i < readerLen; i++)
+
+            const int BlockCopyCapacity = 0x4000;
+            byte[] data = new byte[BlockCopyCapacity];
+            for (long i = 0; i < readerLen; i += BlockCopyCapacity)
             {
-                serializer.Write(m_reader.ReadByte());
+                int chunkSize = (int)Math.Min(readerLen - i, BlockCopyCapacity);
+                m_reader.Read(data, 0, chunkSize);
+                serializer.Write(data, 0, chunkSize);
             }
 
             // Are we writing a format for 1 or greater?   If so we can use the new (breaking) format, otherwise
@@ -570,6 +650,14 @@ namespace Graphs
             deserializer.Read(out m_totalSize);
             RootIndex = (NodeIndex)deserializer.ReadInt();
 
+            // Read in the module names
+            var moduleNamesCount = deserializer.ReadInt();
+            var moduleNames = new string[moduleNamesCount + 1];
+            for (int i = 0; i < moduleNamesCount; i++)
+            {
+                moduleNames[i + 1] = deserializer.ReadString();
+            }
+
             // Read in the Types 
             TypeInfo info = new TypeInfo();
             int typeCount = deserializer.ReadInt();
@@ -578,34 +666,38 @@ namespace Graphs
             {
                 deserializer.Read(out info.Name);
                 deserializer.Read(out info.Size);
-                deserializer.Read(out info.ModuleName);
+                info.ModuleName = moduleNames[deserializer.ReadInt()];
                 m_types.Add(info);
             }
 
             // Read in the Nodes 
             long nodeCount = m_isVeryLargeGraph ? deserializer.ReadInt64() : deserializer.ReadInt();
-            m_nodes = new SegmentedList<StreamLabel>(SegmentSize, nodeCount);
+            m_nodes = new SegmentedList<nuint>(SegmentSize, nodeCount);
 
+            nuint previousLabel = 0;
             for (long i = 0; i < nodeCount; i++)
             {
-                m_nodes.Add((StreamLabel)(uint)deserializer.ReadInt());
+                // Read the label as a compressed differential integer
+                long difference = unchecked(Node.ReadCompressedInt64(deserializer.Reader));
+                nuint currentLabel = unchecked((nuint)((long)previousLabel + difference));
+                m_nodes.Add((nuint)(StreamLabel)(long)currentLabel);
+                previousLabel = currentLabel;
             }
 
             // Read in the Blob stream.  
             // TODO be lazy about reading in the blobs.  
-            int blobCount = deserializer.ReadInt();
-            SegmentedMemoryStreamWriter writer = new SegmentedMemoryStreamWriter(blobCount,
+            long blobCount = deserializer.ReadInt64();
+            const int BlockCopyCapacity = 0x4000;
+            byte[] data = new byte[BlockCopyCapacity];
+
+            MemoryMappedFileStreamWriter writer = new MemoryMappedFileStreamWriter(blobCount,
                 m_isVeryLargeGraph ? new SerializationConfiguration() { StreamLabelWidth = StreamLabelWidth.EightBytes } : null);
 
-            while (8 <= blobCount)
+            for (long i = 0; i < blobCount; i += BlockCopyCapacity)
             {
-                writer.Write(deserializer.ReadInt64());
-                blobCount -= 8;
-            }
-            while(0 < blobCount)
-            {
-                writer.Write(deserializer.ReadByte());
-                --blobCount;
+                int chunkSize = (int)Math.Min(blobCount - i, BlockCopyCapacity);
+                deserializer.Read(data, 0, chunkSize);
+                writer.Write(data, 0, chunkSize);
             }
 
             m_reader = writer.GetReader();
@@ -660,13 +752,13 @@ namespace Graphs
         internal int m_totalRefs;                       // Total Number of references in the graph
         internal GrowableArray<TypeInfo> m_types;       // We expect only thousands of these
         internal GrowableArray<DeferedTypeInfo> m_deferedTypes; // Types that we only have IDs and module image bases.
-        internal SegmentedList<StreamLabel> m_nodes;    // We expect millions of these.  points at a serialize node in m_reader
-        internal SegmentedMemoryStreamReader m_reader; // This is the actual data for the nodes.  Can be large
+        internal SegmentedList<nuint> m_nodes;    // We expect millions of these.  points at a serialize node in m_reader
+        internal MemoryMappedFileStreamReader m_reader; // This is the actual data for the nodes.  Can be large 
         internal StreamLabel m_undefinedObjDef;         // a node of nodeId 'Unknown'.   New nodes start out pointing to this
         // and then can be set to another nodeId (needed when there are cycles).
         // There should not be any of these left as long as every node referenced
         // by another node has a definition.
-        internal SegmentedMemoryStreamWriter m_writer; // Used only during construction to serialize the nodes.
+        internal MemoryMappedFileStreamWriter m_writer; // Used only during construction to serialize the nodes.  
         protected bool m_isVeryLargeGraph;
         #endregion
     }
@@ -684,7 +776,7 @@ namespace Graphs
         {
             get
             {
-                m_graph.m_reader.Goto(m_graph.m_nodes[(int)m_index]);
+                m_graph.m_reader.Goto((StreamLabel)m_graph.m_nodes[(int)m_index]);
                 var typeAndSize = ReadCompressedInt(m_graph.m_reader);
                 if ((typeAndSize & 1) != 0)     // low bit indicates if Size is encoded explicitly
                 {
@@ -707,7 +799,7 @@ namespace Graphs
         /// </summary>
         public void ResetChildrenEnumeration()
         {
-            m_graph.m_reader.Goto(m_graph.m_nodes[(int)m_index]);
+            m_graph.m_reader.Goto((StreamLabel)m_graph.m_nodes[(int)m_index]);
             if ((ReadCompressedInt(m_graph.m_reader) & 1) != 0)        // Skip nodeId and Size
             {
                 ReadCompressedInt(m_graph.m_reader);
@@ -751,7 +843,7 @@ namespace Graphs
         {
             get
             {
-                m_graph.m_reader.Goto(m_graph.m_nodes[(int)m_index]);
+                m_graph.m_reader.Goto((StreamLabel)m_graph.m_nodes[(int)m_index]);
                 if ((ReadCompressedInt(m_graph.m_reader) & 1) != 0)        // Skip nodeId and Size
                 {
                     ReadCompressedInt(m_graph.m_reader);
@@ -764,7 +856,7 @@ namespace Graphs
         {
             get
             {
-                m_graph.m_reader.Goto(m_graph.m_nodes[(int)m_index]);
+                m_graph.m_reader.Goto((StreamLabel)m_graph.m_nodes[(int)m_index]);
                 var ret = (NodeTypeIndex)(ReadCompressedInt(m_graph.m_reader) >> 1);
                 return ret;
             }
@@ -801,7 +893,7 @@ namespace Graphs
                 typeStorage = m_graph.AllocTypeNodeStorage();
             }
 
-            if (m_graph.m_nodes[(int)Index] == StreamLabel.Invalid)
+            if ((StreamLabel)m_graph.m_nodes[(int)Index] == StreamLabel.Invalid)
             {
                 writer.WriteLine("{0}<Node Index=\"{1}\" Undefined=\"true\"{2}/>", prefix, (int)Index, additinalAttribs);
                 return;
@@ -851,7 +943,8 @@ namespace Graphs
         }
 
         // Node information is stored in a compressed form because we have a lot of them. 
-        internal static int ReadCompressedInt(SegmentedMemoryStreamReader reader)
+        internal static int ReadCompressedInt<T>(T reader)
+            where T : IStreamReader
         {
             int ret = 0;
             byte b = reader.ReadByte();
@@ -892,7 +985,90 @@ namespace Graphs
             return ret;
         }
 
-        internal static void WriteCompressedInt(SegmentedMemoryStreamWriter writer, int value)
+        internal static long ReadCompressedInt64<T>(T reader)
+            where T : IStreamReader
+        {
+            long ret = 0;
+            byte b = reader.ReadByte();
+            ret = b << 25 >> 25;
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            ret += (b & 0x7f);
+            if ((b & 0x80) == 0)
+            {
+                return ret;
+            }
+
+            ret <<= 7;
+            b = reader.ReadByte();
+            Debug.Assert((b & 0x80) == 0);
+            ret += b;
+            return ret;
+        }
+
+        internal static void WriteCompressedInt<T>(T writer, int value)
+            where T : IStreamWriter
         {
             if (value << 25 >> 25 == value)
             {
@@ -914,15 +1090,84 @@ namespace Graphs
                 goto fourBytes;
             }
 
-            writer.Write((byte)((value >> 28) | 0x80));
+            writer.Write(unchecked((byte)((value >> 28) | 0x80)));
             fourBytes:
-            writer.Write((byte)((value >> 21) | 0x80));
+            writer.Write(unchecked((byte)((value >> 21) | 0x80)));
             threeBytes:
-            writer.Write((byte)((value >> 14) | 0x80));
+            writer.Write(unchecked((byte)((value >> 14) | 0x80)));
             twoBytes:
-            writer.Write((byte)((value >> 7) | 0x80));
+            writer.Write(unchecked((byte)((value >> 7) | 0x80)));
             oneByte:
-            writer.Write((byte)(value & 0x7F));
+            writer.Write(unchecked((byte)(value & 0x7F)));
+        }
+
+        internal static void WriteCompressedInt64<T>(T writer, long value)
+            where T : IStreamWriter
+        {
+            if (value << 57 >> 57 == value)
+            {
+                goto oneByte;
+            }
+
+            if (value << 50 >> 50 == value)
+            {
+                goto twoBytes;
+            }
+
+            if (value << 43 >> 43 == value)
+            {
+                goto threeBytes;
+            }
+
+            if (value << 36 >> 36 == value)
+            {
+                goto fourBytes;
+            }
+
+            if (value << 29 >> 29 == value)
+            {
+                goto fiveBytes;
+            }
+
+            if (value << 22 >> 22 == value)
+            {
+                goto sixBytes;
+            }
+
+            if (value << 15 >> 15 == value)
+            {
+                goto sevenBytes;
+            }
+
+            if (value << 8 >> 8 == value)
+            {
+                goto eightBytes;
+            }
+
+            if (value << 1 >> 1 == value)
+            {
+                goto nineBytes;
+            }
+
+            writer.Write(unchecked((byte)((value >> 63) | 0x80)));
+        nineBytes:
+            writer.Write(unchecked((byte)((value >> 56) | 0x80)));
+        eightBytes:
+            writer.Write(unchecked((byte)((value >> 49) | 0x80)));
+        sevenBytes:
+            writer.Write(unchecked((byte)((value >> 42) | 0x80)));
+        sixBytes:
+            writer.Write(unchecked((byte)((value >> 35) | 0x80)));
+        fiveBytes:
+            writer.Write(unchecked((byte)((value >> 28) | 0x80)));
+        fourBytes:
+            writer.Write(unchecked((byte)((value >> 21) | 0x80)));
+        threeBytes:
+            writer.Write(unchecked((byte)((value >> 14) | 0x80)));
+        twoBytes:
+            writer.Write(unchecked((byte)((value >> 7) | 0x80)));
+        oneByte:
+            writer.Write(unchecked((byte)(value & 0x7F)));
         }
 
         internal NodeIndex m_index;
@@ -1093,7 +1338,7 @@ namespace Graphs
         public void ToStream(Serializer serializer)
         {
             serializer.Write(Path);
-            serializer.Write((long)ImageBase);
+            serializer.Write(ImageBase);
             serializer.Write(Size);
             serializer.Write(BuildTime.Ticks);
             serializer.Write(PdbName);
@@ -1106,7 +1351,7 @@ namespace Graphs
         public void FromStream(Deserializer deserializer)
         {
             deserializer.Read(out Path);
-            ImageBase = (Address)deserializer.ReadInt64();
+            ImageBase = deserializer.ReadUInt64();
             deserializer.Read(out Size);
             BuildTime = new DateTime(deserializer.ReadInt64());
             deserializer.Read(out PdbName);
@@ -1736,10 +1981,10 @@ public class SpanningTree
             m_parent[i] = NodeIndex.Invalid;
         }
 
-        float[] nodePriorities = new float[m_parent.Length];
+        double[] nodePriorities = new double[m_parent.Length];
         bool scanedForOrphans = false;
         var epsilon = 1E-7F;            // Something that is big enough not to bet lost in roundoff error.  
-        float order = 0;
+        double order = 0;
         for (int i = 0; ; i++)
         {
             if ((i & 0x1FFF) == 0)  // Every 8K
@@ -1748,7 +1993,7 @@ public class SpanningTree
             }
 
             NodeIndex nodeIndex;
-            float nodePriority;
+            double nodePriority;
             if (nodesToVisit.Count == 0)
             {
                 nodePriority = 0;
@@ -1933,12 +2178,12 @@ public class SpanningTree
     {
         if (m_typePriorities == null)
         {
-            m_typePriorities = new float[(int)m_graph.NodeTypeIndexLimit];
+            m_typePriorities = new double[(int)m_graph.NodeTypeIndexLimit];
         }
 
         string[] priorityPatArray = priorityPats.Split(';');
         Regex[] priorityRegExArray = new Regex[priorityPatArray.Length];
-        float[] priorityArray = new float[priorityPatArray.Length];
+        double[] priorityArray = new double[priorityPatArray.Length];
         for (int i = 0; i < priorityPatArray.Length; i++)
         {
             var m = Regex.Match(priorityPatArray[i], @"(.*)->(-?\d+.?\d*)");
@@ -1954,7 +2199,7 @@ public class SpanningTree
 
             var dotNetRegEx = ToDotNetRegEx(m.Groups[1].Value.Trim());
             priorityRegExArray[i] = new Regex(dotNetRegEx, RegexOptions.IgnoreCase);
-            priorityArray[i] = float.Parse(m.Groups[2].Value);
+            priorityArray[i] = double.Parse(m.Groups[2].Value);
         }
 
         // Assign every type index a priority in m_typePriorities based on if they match a pattern.  
@@ -1988,7 +2233,7 @@ public class SpanningTree
 
     // We give each type a priority (using the m_priority Regular expressions) which guide the breadth-first scan. 
     private string m_priorityRegExs;
-    private float[] m_typePriorities;
+    private double[] m_typePriorities;
     private NodeType m_typeStorage;
     private Node m_nodeStorage;                 // Only for things that can't be reentrant
     private Node m_childStorage;
@@ -2008,7 +2253,7 @@ internal class PriorityQueue
         m_heap = new DataItem[initialSize];
     }
     public int Count { get { return m_count; } }
-    public void Enqueue(NodeIndex item, float priority)
+    public void Enqueue(NodeIndex item, double priority)
     {
         var idx = m_count;
         if (idx >= m_heap.Length)
@@ -2042,7 +2287,7 @@ internal class PriorityQueue
         }
         // CheckInvariant();
     }
-    public NodeIndex Dequeue(out float priority)
+    public NodeIndex Dequeue(out double priority)
     {
         Debug.Assert(Count > 0);
 
@@ -2092,13 +2337,21 @@ internal class PriorityQueue
         // Sort the items in descending order 
         var items = new List<DataItem>(m_count);
         for (int i = 0; i < m_count; i++)
+        {
             items.Add(m_heap[i]);
+        }
+
         items.Sort((x, y) => y.priority.CompareTo(x.priority));
         if (items.Count > 0)
+        {
             Debug.Assert(items[0].value == m_heap[0].value);
+        }
 
         foreach (var item in items)
+        {
             sb.Append("{").Append((int)item.value).Append(", ").Append(item.priority.ToString("f1")).Append("}").AppendLine();
+        }
+
         sb.AppendLine("</PriorityQueue>");
         return sb.ToString();
     }
@@ -2106,8 +2359,8 @@ internal class PriorityQueue
 
     private struct DataItem
     {
-        public DataItem(NodeIndex value, float priority) { this.value = value; this.priority = priority; }
-        public float priority;
+        public DataItem(NodeIndex value, double priority) { this.value = value; this.priority = priority; }
+        public double priority;
         public NodeIndex value;
     }
     [Conditional("DEBUG")]
@@ -2147,7 +2400,7 @@ public class GraphSampler
         m_graph = graph;
         m_log = log;
         m_targetNodeCount = targetNodeCount;
-        m_filteringRatio = (float)graph.NodeCount / targetNodeCount;
+        m_filteringRatio = (double)graph.NodeCount / targetNodeCount;
         m_nodeStorage = m_graph.AllocNodeStorage();
         m_childNodeStorage = m_graph.AllocNodeStorage();
         m_nodeTypeStorage = m_graph.AllocTypeNodeStorage();
@@ -2241,7 +2494,7 @@ public class GraphSampler
             m_newTypeIndexes[i] = NodeTypeIndex.Invalid;
         }
 
-        GrowableArray<NodeIndex> children = new GrowableArray<NodeIndex>(100);
+        HashSet<NodeIndex> children = new HashSet<NodeIndex>();
         for (NodeIndex nodeIdx = 0; nodeIdx < (NodeIndex)m_newIndex.Length; nodeIdx++)
         {
             // Add all sampled nodes to the new graph.  
@@ -2319,20 +2572,20 @@ public class GraphSampler
     /// the returned graph returned by GetSampledGraph.   If the sampled count for that type multiplied
     /// by this scaling factor, you end up with the count for that type of the original unsampled graph.  
     /// </summary>
-    public float[] CountScalingByType
+    public double[] CountScalingByType
     {
         get
         {
-            var ret = new float[m_newGraph.NodeTypeCount];
+            var ret = new double[m_newGraph.NodeTypeCount];
             for (int i = 0; i < m_statsByType.Length; i++)
             {
                 var newTypeIndex = MapTypeIndex((NodeTypeIndex)i);
                 if (newTypeIndex != NodeTypeIndex.Invalid)
                 {
-                    float scale = 1;
+                    double scale = 1;
                     if (m_statsByType[i].SampleMetric != 0)
                     {
-                        scale = (float)((double)m_statsByType[i].TotalMetric / m_statsByType[i].SampleMetric);
+                        scale = (double)m_statsByType[i].TotalMetric / m_statsByType[i].SampleMetric;
                     }
 
                     ret[(int)newTypeIndex] = scale;
@@ -2562,7 +2815,7 @@ public class GraphSampler
             statsCheckByType[(int)node.TypeIndex] = stats;
         }
 
-        float[] scalings = null;
+        double[] scalings = null;
         if (completed)
         {
             scalings = CountScalingByType;
@@ -2654,7 +2907,7 @@ public class GraphSampler
     private Node m_nodeStorage;
     private Node m_childNodeStorage;
     private NodeType m_nodeTypeStorage;
-    private float m_filteringRatio;
+    private double m_filteringRatio;
     private SampleStats[] m_statsByType;
     private int m_numDistictTypesWithSamples;
     private int m_numDistictTypes;

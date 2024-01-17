@@ -1,4 +1,5 @@
 ﻿using FastSerialization;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using Address = System.UInt64;
@@ -7,31 +8,31 @@ namespace Graphs
 {
     public class MemoryGraph : Graph, IFastSerializable
     {
-        public MemoryGraph(int expectedSize, bool isVeryLargeGraph = false)
+        public MemoryGraph(int expectedSize, bool isVeryLargeGraph = true)
             : base(expectedSize, isVeryLargeGraph)
         {
             // If we have too many addresses we will reach the Dictionary's internal array's size limit and throw.
             // Therefore use a new implementation of it that is similar in performance but that can handle the extra load.
             if (isVeryLargeGraph)
             {
-                m_addressToNodeIndex = new SegmentedDictionary<Address, NodeIndex>(expectedSize);
+                m_addressToNodeIndex = new SegmentedDictionary<nuint, NodeIndex>(expectedSize);
             }
             else
             {
-                m_addressToNodeIndex = new Dictionary<Address, NodeIndex>(expectedSize);
+                m_addressToNodeIndex = new Dictionary<nuint, NodeIndex>(expectedSize);
             }
                                                               
-            m_nodeAddresses = new SegmentedList<Address>(SegmentSize, expectedSize);
+            m_nodeAddresses = new SegmentedList<nuint>(SegmentSize, expectedSize);
         }
 
         public void WriteAsBinaryFile(string outputFileName)
         {
-            Serializer serializer = new Serializer(outputFileName, this);
+            Serializer serializer = new Serializer(new IOStreamStreamWriter( outputFileName, new SerializationConfiguration() { StreamLabelWidth = StreamLabelWidth.EightBytes }), this);
             serializer.Close();
         }
         public static MemoryGraph ReadFromBinaryFile(string inputFileName)
         {
-            Deserializer deserializer = new Deserializer(inputFileName);
+            Deserializer deserializer = new Deserializer(inputFileName, new SerializationConfiguration() { StreamLabelWidth = StreamLabelWidth.EightBytes });
             deserializer.TypeResolver = typeName => System.Type.GetType(typeName);  // resolve types in this assembly (and mscorlib)
             deserializer.RegisterFactory(typeof(MemoryGraph), delegate () { return new MemoryGraph(1); });
             deserializer.RegisterFactory(typeof(Graphs.Module), delegate () { return new Graphs.Module(0); });
@@ -56,7 +57,7 @@ namespace Graphs
         public void SetAddress(NodeIndex nodeIndex, Address nodeAddress)
         {
             Debug.Assert(m_nodeAddresses[(int)nodeIndex] == 0, "Calling SetAddress twice for node index " + nodeIndex);
-            m_nodeAddresses[(int)nodeIndex] = nodeAddress;
+            m_nodeAddresses[(int)nodeIndex] = checked((nuint)nodeAddress);
         }
         public override NodeIndex CreateNode()
         {
@@ -101,19 +102,47 @@ namespace Graphs
         /// </summary>
         public NodeIndex GetNodeIndex(Address objectAddress)
         {
+            nuint nativeObjectAddress = ToNativeAddress(objectAddress);
             NodeIndex nodeIndex;
-            if (!m_addressToNodeIndex.TryGetValue(objectAddress, out nodeIndex))
+            if (!m_addressToNodeIndex.TryGetValue(nativeObjectAddress, out nodeIndex))
             {
                 nodeIndex = CreateNode();
-                m_nodeAddresses[(int)nodeIndex] = objectAddress;
-                m_addressToNodeIndex.Add(objectAddress, nodeIndex);
+                m_nodeAddresses[(int)nodeIndex] = nativeObjectAddress;
+                m_addressToNodeIndex.Add(nativeObjectAddress, nodeIndex);
             }
-            Debug.Assert(m_nodeAddresses[(int)nodeIndex] == objectAddress);
+            Debug.Assert(m_nodeAddresses[(int)nodeIndex] == ToNativeAddress(objectAddress));
             return nodeIndex;
         }
         public bool IsInGraph(Address objectAddress)
         {
-            return m_addressToNodeIndex.ContainsKey(objectAddress);
+            return m_addressToNodeIndex.ContainsKey(ToNativeAddress(objectAddress));
+        }
+
+        private static nuint ToNativeAddress(Address objectAddress)
+        {
+            if (IntPtr.Size == 8)
+            {
+                return checked((nuint)objectAddress);
+            }
+            else
+            {
+                const ulong Mask32 = ~(ulong)uint.MaxValue;
+                const ulong Mask33 = Mask32 | 0x80000000;
+                if ((objectAddress & Mask32) == 0)
+                {
+                    // not a sign-extended address
+                    return checked((nuint)objectAddress);
+                }
+                else if ((objectAddress & Mask33) == Mask33)
+                {
+                    // This is an incorrectly sign-extended 32-bit address
+                    return unchecked((nuint)objectAddress);
+                }
+                else
+                {
+                    throw new ArgumentException("Unsupported object address", nameof(objectAddress));
+                }
+            }
         }
 
         /// <summary>
@@ -121,7 +150,7 @@ namespace Graphs
         /// THis table maps the ID that CLRProfiler uses (an address), to the NodeIndex we have assigned to it.  
         /// It is only needed while the file is being read in.  
         /// </summary>
-        protected IDictionary<Address, NodeIndex> m_addressToNodeIndex;    // This field is only used during construction
+        protected IDictionary<nuint, NodeIndex> m_addressToNodeIndex;    // This field is only used during construction
 
         #endregion
         #region private
@@ -137,13 +166,77 @@ namespace Graphs
             {
                 serializer.Write((int)m_nodeAddresses.Count);
             }
-            
-            for (int i = 0; i < m_nodeAddresses.Count; i++)
+
+            // Write m_nodeAddresses as a sequence of groups of addresses near each other. The following assumptions are
+            // made for this process:
+            //
+            // 1. It is common for multiple objects to have addresses within ushort.MaxValue of each other
+            // 2. It is common for an element of m_nodeAddresses to have the address 0
+            // 3. The address at index 'i+1' will never be the same value as index 'i', unless that value is 0
+            //
+            // Assumption (3) allows '0' values in m_nodeAddresses to be written with the differential value '0', which
+            // is efficient and does not interrupt the grouping of a segment of otherwise-similar addresses.
+            int offset = 0;
+            foreach (var pair in GroupNodeAddresses(m_nodeAddresses))
             {
-                serializer.Write((long)m_nodeAddresses[i]);
+                // A group is written as:
+                //
+                // 1. Int32: The number of elements in the group
+                // 2. Int64: The address of the first element in the group
+                // 3. UInt16 (repeat N times, where N = #Group - 1):
+                //    a. 0, if the nth element of the group has the address 0
+                //    b. Otherwise, the offset of the nth relative to the address of the first element in the group
+                serializer.Write(pair.Value);
+                serializer.Write(pair.Key);
+                Debug.Assert(pair.Key == m_nodeAddresses[offset]);
+
+                for (int i = 1; i < pair.Value; i++)
+                {
+                    Address current = m_nodeAddresses[i + offset];
+                    if (current == 0)
+                    {
+                        serializer.Write((short)0);
+                        continue;
+                    }
+
+                    ushort relativeAddress = (ushort)(current - pair.Key);
+                    serializer.Write(relativeAddress);
+                }
+
+                offset += pair.Value;
             }
 
             serializer.WriteTagged(Is64Bit);
+
+            IEnumerable<KeyValuePair<Address, int>> GroupNodeAddresses(SegmentedList<nuint> nodeAddresses)
+            {
+                if (nodeAddresses.Count == 0)
+                    yield break;
+
+                var baseAddress = nodeAddresses[0];
+                var startIndex = 0;
+                for (int i = 1; i < nodeAddresses.Count; i++)
+                {
+                    var current = nodeAddresses[i];
+                    if (current == 0)
+                    {
+                        continue;
+                    }
+
+                    if (unchecked(current - baseAddress) <= ushort.MaxValue)
+                    {
+                        continue;
+                    }
+
+                    var count = i - startIndex;
+                    yield return new KeyValuePair<Address, int>(baseAddress, count);
+
+                    baseAddress = current;
+                    startIndex = i;
+                }
+
+                yield return new KeyValuePair<Address, int>(baseAddress, checked((int)(nodeAddresses.Count - startIndex)));
+            }
         }
 
         void IFastSerializable.FromStream(Deserializer deserializer)
@@ -151,11 +244,29 @@ namespace Graphs
             base.FromStream(deserializer);
             // Read in the Memory addresses of each object 
             long addressCount = m_isVeryLargeGraph ? deserializer.ReadInt64() : deserializer.ReadInt();
-            m_nodeAddresses = new SegmentedList<Address>(SegmentSize, addressCount);
+            m_nodeAddresses = new SegmentedList<nuint>(SegmentSize, addressCount);
 
-            for (long i = 0; i < addressCount; i++)
+            // See ToStream above for a description of the differential compression process
+            long offset = 0;
+            while (offset < addressCount)
             {
-                m_nodeAddresses.Add((Address)deserializer.ReadInt64());
+                int groupCount = deserializer.ReadInt();
+                nuint baseAddress = checked((nuint)deserializer.ReadUInt64());
+                m_nodeAddresses.Add(baseAddress);
+                for (long i = 1; i < groupCount; i++)
+                {
+                    ushort relativeAddress = deserializer.ReadUInt16();
+                    if (relativeAddress == 0)
+                    {
+                        m_nodeAddresses.Add(0);
+                    }
+                    else
+                    {
+                        m_nodeAddresses.Add(baseAddress + relativeAddress);
+                    }
+                }
+
+                offset += groupCount;
             }
 
             bool is64bit = false;
@@ -165,8 +276,37 @@ namespace Graphs
 
         // This array survives after the constructor completes
         // TODO Fold this into the existing blob. Currently this dominates the Size cost of the graph!
-        protected SegmentedList<Address> m_nodeAddresses;
+        protected SegmentedList<nuint> m_nodeAddresses;
         #endregion
+    }
+
+    internal sealed class NativeIntegerEqualityComparer : IEqualityComparer<nuint>, IEqualityComparer<nint>
+    {
+        public static readonly NativeIntegerEqualityComparer Instance = new();
+
+        private NativeIntegerEqualityComparer()
+        {
+        }
+
+        public bool Equals(nint x, nint y)
+        {
+            return x == y;
+        }
+
+        public bool Equals(nuint x, nuint y)
+        {
+            return x == y;
+        }
+
+        public int GetHashCode(nint obj)
+        {
+            return obj.GetHashCode();
+        }
+
+        public int GetHashCode(nuint obj)
+        {
+            return obj.GetHashCode();
+        }
     }
 
     /// <summary>
@@ -214,9 +354,10 @@ namespace Graphs
                 Index = m_graph.CreateNode();
             }
 
-            Debug.Assert(m_graph.m_nodes[(int)Index] == m_graph.m_undefinedObjDef, "SetNode cannot be called on the nodeIndex passed");
+            Debug.Assert((StreamLabel)m_graph.m_nodes[(int)Index] == m_graph.m_undefinedObjDef, "SetNode cannot be called on the nodeIndex passed");
             ModuleName = moduleName;
             m_mutableChildren = new List<MemoryNodeBuilder>();
+            m_unmutableChildren = new HashSet<NodeIndex>();
             m_typeIndex = NodeTypeIndex.Invalid;
         }
 
@@ -303,7 +444,7 @@ namespace Graphs
 
         private NodeTypeIndex m_typeIndex;
         private List<MemoryNodeBuilder> m_mutableChildren;
-        private GrowableArray<NodeIndex> m_unmutableChildren;
+        private HashSet<NodeIndex> m_unmutableChildren;
         private MemoryGraph m_graph;
         #endregion
     }

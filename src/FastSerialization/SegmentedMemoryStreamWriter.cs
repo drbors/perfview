@@ -5,7 +5,7 @@ using System.IO;
 
 namespace FastSerialization
 {
-    public class SegmentedMemoryStreamWriter
+    public class SegmentedMemoryStreamWriter : IStreamWriter
     {
         public SegmentedMemoryStreamWriter(SerializationConfiguration config = null) : this(64, config) { }
         public SegmentedMemoryStreamWriter(long initialSize, SerializationConfiguration config = null)
@@ -80,6 +80,12 @@ namespace FastSerialization
                 }
             }
         }
+
+        void IStreamWriter.Write(byte[] data, int offset, int length)
+        {
+            throw new NotImplementedException();
+        }
+
         public virtual StreamLabel GetLabel()
         {
             return (StreamLabel)Length;
